@@ -41,3 +41,5 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 - Song metadata needs ffmpeg — see `tools/ffmpeg.exe` (auto-downloaded).
 - The easter egg only shows when the right panel is pulled out.
+
+  <img width="3834" height="2155" alt="image" src="https://github.com/user-attachments/assets/a0229338-0044-44a5-872a-f358cce1f9ca" />
