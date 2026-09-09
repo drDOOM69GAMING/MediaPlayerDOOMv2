@@ -1,0 +1,27 @@
+[package]
+name = "mediaplayerofdoom"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.36"
+rodio = { version = "0.19", features = ["symphonia-all"] }
+lofty = "0.22"
+symphonia = "0.5"
+hound = "3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "native-tls"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+rand = "0.9"
+rfd = "0.14"
+tray-icon = "0.24"
+global-hotkey = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
