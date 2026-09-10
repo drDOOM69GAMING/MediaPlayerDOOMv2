@@ -23,7 +23,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use lofty::prelude::*;
 
 const APP_NAME: &str = "Random Shuffle Player";
-const APP_VERSION: &str = "2.3.0";
+const APP_VERSION: &str = "2.4.0";
 
 const AUDIO_FORMATS: [&str; 16] = [
     "mp3", "wav", "flac", "m4a", "m4b", "m4p", "ogg", "oga", "aac", "aiff", "aif", "wma", "wv", "mpc", "opus", "webm",
@@ -667,10 +667,30 @@ struct Settings {
     video_volume: u32,
     #[serde(default)]
     last_cd_dir: Option<String>,
+    #[serde(default)]
+    video_positions: HashMap<String, f32>,
+    #[serde(default)]
+    intro_skip_enabled: bool,
+    #[serde(default = "default_intro_skip")]
+    intro_skip_secs: f32,
+    #[serde(default = "default_credits_skip")]
+    credits_skip_secs: f32,
+    #[serde(default)]
+    video_bounds: HashMap<String, (f32, f32)>,
+    #[serde(default)]
+    show_bounds: HashMap<String, (f32, f32)>,
 }
 
 fn default_video_volume() -> u32 {
     100
+}
+
+fn default_intro_skip() -> f32 {
+    90.0
+}
+
+fn default_credits_skip() -> f32 {
+    90.0
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -843,6 +863,7 @@ enum Msg {
     VideoClosed { gen: u64 },
     VideoPos { gen: u64, secs: f32 },
     VideoMeta { gen: u64, dur: f32 },
+    VideoBounds { gen: u64, path: String, intro_end: f32, credits_start: f32 },
 }
 
 enum LibCmd {
@@ -860,6 +881,7 @@ enum LibCmd {
     VideoOpen { path: String, gen: u64, seek: f32 },
     VideoClose,
     VideoPause(bool),
+    VideoAnalyze { path: String, gen: u64 },
 }
 
 enum NetCmd {
@@ -1045,6 +1067,143 @@ fn probe_video_duration(path: &str) -> f32 {
             .unwrap_or(0.0),
         Err(_) => 0.0,
     }
+}
+
+fn video_audio_levels(path: &str, ffmpeg: &Path, start: f32, len: f32) -> Vec<f32> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if start > 0.0 {
+        cmd.args(["-ss"]).arg(format!("{:.2}", start));
+    }
+    cmd.arg("-i").arg(path)
+        .args(["-t"]).arg(format!("{:.2}", len))
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(NO_WINDOW);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let Some(mut stdout) = child.stdout.take() else { return vec![] };
+    let mut out: Vec<f32> = Vec::new();
+    let mut buf = vec![0u8; 8000];
+    loop {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match stdout.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => break,
+            }
+        }
+        if filled < 2 {
+            break;
+        }
+        let samples = filled / 2;
+        let mut sum = 0.0f64;
+        for i in 0..samples {
+            let s = i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as f64 / 32768.0;
+            sum += s * s;
+        }
+        let rms = (sum / samples as f64).sqrt();
+        let db = if rms > 1e-9 { 20.0 * rms.log10() } else { -120.0 };
+        out.push(db as f32);
+        if filled < buf.len() {
+            break;
+        }
+    }
+    let _ = child.wait();
+    out
+}
+
+fn smooth_curve(v: &[f32], w: usize) -> Vec<f32> {
+    let mut s = vec![0.0; v.len()];
+    for i in 0..v.len() {
+        let lo = i.saturating_sub(w);
+        let hi = (i + w).min(v.len());
+        let cnt = hi - lo;
+        if cnt > 0 {
+            s[i] = v[lo..hi].iter().sum::<f32>() / cnt as f32;
+        }
+    }
+    s
+}
+
+fn median_of(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
+fn detect_intro_end(levels: &[f32], secs_per_sample: f32) -> f32 {
+    if levels.len() < 40 {
+        return 0.0;
+    }
+    let n = (levels.len() as f32 * 0.6).min(levels.len() as f32) as usize;
+    let sm = smooth_curve(&levels[..n], 4);
+    let med = median_of(&sm);
+    let active = med + 3.5;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < sm.len() {
+        if sm[i] >= active {
+            let s = i;
+            while i < sm.len() && sm[i] >= active {
+                i += 1;
+            }
+            runs.push((s, i));
+        } else {
+            i += 1;
+        }
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in runs {
+        if let Some(last) = merged.last_mut() {
+            if s as isize - last.1 as isize <= 4 {
+                last.1 = e;
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    for (s, e) in merged {
+        let len_secs = (e - s) as f32 * secs_per_sample;
+        let end_secs = e as f32 * secs_per_sample;
+        if len_secs >= 15.0 && end_secs >= 35.0 {
+            return end_secs;
+        }
+    }
+    0.0
+}
+
+fn detect_credit_start(slice: &[f32], secs_per_sample: f32) -> f32 {
+    if slice.len() < 30 {
+        return 0.0;
+    }
+    let sm = smooth_curve(slice, 4);
+    let med = median_of(&sm);
+    let active = med + 3.0;
+    let mut i = sm.len();
+    while i > 0 {
+        if sm[i - 1] >= active {
+            let mut s = i - 1;
+            while s > 0 && sm[s - 1] >= active {
+                s -= 1;
+            }
+            let len = (i - s) as f32 * secs_per_sample;
+            if len >= 20.0 {
+                return s as f32 * secs_per_sample;
+            }
+            i = s;
+        } else {
+            i -= 1;
+        }
+    }
+    0.0
 }
 
 fn fmt_time(s: f32) -> String {
@@ -1251,6 +1410,37 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
             }
             LibCmd::VideoPause(p) => {
                 video_pause.store(p, std::sync::atomic::Ordering::Relaxed);
+            }
+            LibCmd::VideoAnalyze { path, gen } => {
+                let tx2 = tx.clone();
+                std::thread::spawn(move || {
+                    let dur = probe_video_duration(&path);
+                    if dur <= 0.0 {
+                        let _ = tx2.send(Msg::VideoBounds { gen, path, intro_end: 0.0, credits_start: 0.0 });
+                        return;
+                    }
+                    let ff = ffmpeg_path();
+                    let front_len = dur.min(420.0);
+                    let front = video_audio_levels(&path, &ff, 0.0, front_len);
+                    let mut intro = detect_intro_end(&front, 0.5);
+                    let mut credits = 0.0f32;
+                    if dur > 240.0 {
+                        let back_len = dur.min(420.0);
+                        let back_start = (dur - back_len).max(0.0);
+                        let back = video_audio_levels(&path, &ff, back_start, back_len);
+                        let rel = detect_credit_start(&back, 0.5);
+                        if rel > 0.0 {
+                            credits = back_start + rel;
+                        }
+                    }
+                    if intro >= dur - 5.0 {
+                        intro = 0.0;
+                    }
+                    if credits > 0.0 && credits > dur - 3.0 {
+                        credits = 0.0;
+                    }
+                    let _ = tx2.send(Msg::VideoBounds { gen, path, intro_end: intro, credits_start: credits });
+                });
             }
         }
 }
@@ -1920,6 +2110,13 @@ struct PlayerApp {
     video_volume: u32,
     deck_resume: Option<(String, f32)>,
     video_queue_pin: bool,
+    video_positions: HashMap<String, f32>,
+    intro_skip_enabled: bool,
+    intro_skip_secs: f32,
+    credits_skip_secs: f32,
+    video_bounds: HashMap<String, (f32, f32)>,
+    show_bounds: HashMap<String, (f32, f32)>,
+    analyzing_video: HashSet<String>,
     random_on: bool,
     switch_accum: f32,
 }
@@ -1940,6 +2137,12 @@ impl PlayerApp {
         let mut video_aspect_default = VideoAspect::Original;
         let mut video_volume = 100;
         let mut last_cd_dir: Option<String> = None;
+        let mut video_positions: HashMap<String, f32> = HashMap::new();
+        let mut intro_skip_enabled = false;
+        let mut intro_skip_secs: f32 = 90.0;
+        let mut credits_skip_secs: f32 = 90.0;
+        let mut video_bounds: HashMap<String, (f32, f32)> = HashMap::new();
+        let mut show_bounds: HashMap<String, (f32, f32)> = HashMap::new();
         if let Ok(text) = std::fs::read_to_string(&settings_path) {
             if let Ok(s) = serde_json::from_str::<Settings>(&text) {
                 state.volume = s.volume.clamp(0, 100);
@@ -1951,6 +2154,12 @@ impl PlayerApp {
                 video_aspect_default = s.video_aspect_default;
                 video_volume = s.video_volume.clamp(0, 200);
                 last_cd_dir = s.last_cd_dir.filter(|d| Path::new(d).is_dir());
+                video_positions = s.video_positions;
+                intro_skip_enabled = s.intro_skip_enabled;
+                intro_skip_secs = s.intro_skip_secs;
+                credits_skip_secs = s.credits_skip_secs;
+                video_bounds = s.video_bounds;
+                show_bounds = s.show_bounds;
             }
         }
         if let Ok(text) = std::fs::read_to_string(&history_path) {
@@ -2087,6 +2296,13 @@ video_ended: false,
         video_volume,
         deck_resume: None,
             video_queue_pin: false,
+            video_positions: HashMap::new(),
+            intro_skip_enabled: false,
+            intro_skip_secs: 90.0,
+            credits_skip_secs: 90.0,
+            video_bounds: HashMap::new(),
+            show_bounds: HashMap::new(),
+            analyzing_video: HashSet::new(),
             random_on: true,
             switch_accum: 0.0,
             bands_path,
@@ -2132,6 +2348,12 @@ video_ended: false,
             video_aspect_default: self.video_aspect_default,
             video_volume: self.video_volume,
             last_cd_dir: self.last_cd_dir.clone(),
+            video_positions: self.video_positions.clone(),
+            intro_skip_enabled: self.intro_skip_enabled,
+            intro_skip_secs: self.intro_skip_secs,
+            credits_skip_secs: self.credits_skip_secs,
+            video_bounds: self.video_bounds.clone(),
+            show_bounds: self.show_bounds.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&s) {
             let _ = std::fs::write(&self.settings_path, text);
@@ -2425,6 +2647,10 @@ video_ended: false,
                 Msg::VideoClosed { gen } => {
                     let was_eof = gen == self.video_gen && !self.video_closing;
                     if was_eof {
+                        if let Some(path) = self.video_current.clone() {
+                            self.video_positions.remove(&path);
+                            self.save_settings();
+                        }
                         if !self.video_queue.is_empty() {
                             self.queue_next();
                         } else {
@@ -2437,11 +2663,46 @@ video_ended: false,
                 Msg::VideoPos { gen, secs } => {
                     if gen == self.video_gen {
                         self.video_cur_secs = secs;
+                        if self.intro_skip_enabled && self.video_dur_secs > 0.0 {
+                            let (ie, cs) = self.video_bound_secs();
+                            if secs < ie && ie > 2.0 {
+                                self.seek_video(ie + 1.0);
+                                self.set_status(format!("Skipped intro → {:.0}s ({})", ie, fmt_time(ie)));
+                            } else if cs > 2.0 && secs >= cs {
+                                if !self.video_queue.is_empty() {
+                                    self.queue_next();
+                                    self.set_status("Skipped credits → next video");
+                                }
+                            }
+                        }
                     }
                 }
                 Msg::VideoMeta { gen, dur } => {
                     if gen == self.video_gen {
                         self.video_dur_secs = dur;
+                    }
+                }
+                Msg::VideoBounds { gen, path, intro_end, credits_start } => {
+                    if gen == self.video_gen {
+                        self.analyzing_video.remove(&path);
+                        let had = self.video_bounds.get(&path).copied();
+                        if (intro_end > 2.0 || credits_start > 2.0) && had != Some((intro_end, credits_start)) {
+                            self.video_bounds.insert(path.clone(), (intro_end, credits_start));
+                            if let Some(dir) = Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()) {
+                                let merged = self.show_bounds.get(&dir).copied();
+                                match merged {
+                                    Some((pi, pc)) => {
+                                        let ni = if intro_end > 2.0 { intro_end } else { pi };
+                                        let nc = if credits_start > 2.0 { credits_start } else { pc };
+                                        self.show_bounds.insert(dir, (ni, nc));
+                                    }
+                                    None => {
+                                        self.show_bounds.insert(dir, (intro_end, credits_start));
+                                    }
+                                }
+                            }
+                            self.save_settings();
+                        }
                     }
                 }
             }
@@ -3264,11 +3525,6 @@ video_ended: false,
 
     fn skip_backward(&mut self) {
         self.seek_skip(-10.0);
-    }
-
-    fn wind_burst(&mut self, d: f32) {
-        self.seek_skip(d * if d > 0.0 { 1.0 } else { 1.0 });
-        self.winding = None;
     }
 
     fn step_tape(&mut self, dt: f32) {
@@ -4326,10 +4582,6 @@ video_ended: false,
                 let rec_red = Color32::from_rgb(205, 45, 45);
                 let wn = ui.input(|i| i.time);
                 let rew = deck_key(ui, "REW", th.btn_fg, th.btn_bg);
-                if rew.clicked() {
-                    self.seek_skip(-10.0);
-                    self.set_status(format!("REW click -10s | pos={:.1}", self.pos));
-                }
                 if rew.drag_started() {
                     self.wind_arm = Some((-1.0, wn));
                 }
@@ -4337,10 +4589,6 @@ video_ended: false,
                     if self.state.is_paused { self.unpause_music(); } else { self.pause_music(); }
                 }
                 let fwd = deck_key(ui, "FWD", th.btn_fg, th.btn_bg);
-                if fwd.clicked() {
-                    self.seek_skip(10.0);
-                    self.set_status(format!("FWD click +10s | pos={:.1}", self.pos));
-                }
                 if fwd.drag_started() {
                     self.wind_arm = Some((1.0, wn));
                 }
@@ -4349,22 +4597,22 @@ video_ended: false,
                         self.set_winding(Some(d));
                     }
                 }
+                if rew.clicked() && self.winding.is_none() {
+                    self.seek_skip(-10.0);
+                    self.set_status(format!("REW -10s | pos={:.1}", self.pos));
+                }
+                if fwd.clicked() && self.winding.is_none() {
+                    self.seek_skip(10.0);
+                    self.set_status(format!("FWD +10s | pos={:.1}", self.pos));
+                }
                 if rew.drag_stopped() {
-                    if let Some((d, _)) = self.wind_arm.take() {
-                        if self.winding.is_none() {
-                            self.wind_burst(d * 12.0);
-                        }
-                    }
+                    self.wind_arm.take();
                     if self.winding == Some(-1.0) {
                         self.set_winding(None);
                     }
                 }
                 if fwd.drag_stopped() {
-                    if let Some((d, _)) = self.wind_arm.take() {
-                        if self.winding.is_none() {
-                            self.wind_burst(d * 12.0);
-                        }
-                    }
+                    self.wind_arm.take();
                     if self.winding == Some(1.0) {
                         self.set_winding(None);
                     }
@@ -5002,7 +5250,8 @@ video_ended: false,
         self.stop_music();
         self.video_gen += 1;
         let gen = self.video_gen;
-        let _ = self.lib_tx.send(LibCmd::VideoOpen { path: path.clone(), gen, seek: 0.0 });
+        let saved_pos = self.video_positions.get(&path).copied().unwrap_or(0.0);
+        let _ = self.lib_tx.send(LibCmd::VideoOpen { path: path.clone(), gen, seek: saved_pos });
         self.video_aspect = self.video_aspects.get(&path).copied().unwrap_or(self.video_aspect_default);
         self.video_on = true;
         self.video_paused = false;
@@ -5014,8 +5263,10 @@ video_ended: false,
         self.video_cur_secs = 0.0;
         self.video_seek_t = None;
         self.video_current = Some(path.clone());
-        self.attach_video_audio(&path, 0.0);
+        self.attach_video_audio(&path, saved_pos);
+        self.video_cur_secs = saved_pos;
         self.set_status(format!("MOVIE {}/{}: {}", self.video_queue_idx + 1, self.video_queue.len(), stem(&path)));
+        self.maybe_analyze_video(&path);
     }
 
     fn enqueue_videos(&mut self, paths: Vec<String>) {
@@ -5073,6 +5324,56 @@ video_ended: false,
         }
     }
 
+    fn video_bound_secs(&self) -> (f32, f32) {
+        let mut intro = if self.intro_skip_secs > 2.0 { self.intro_skip_secs } else { 90.0 };
+        let mut credits = if self.video_dur_secs > 0.0 {
+            (self.video_dur_secs - self.credits_skip_secs).max(0.0)
+        } else {
+            0.0
+        };
+        if let Some(p) = self.video_current.clone() {
+            if let Some(&(ie, cs)) = self.video_bounds.get(&p) {
+                if ie > 2.0 {
+                    intro = ie;
+                }
+                if cs > 2.0 {
+                    credits = cs;
+                }
+            } else if let Some(dir) = Path::new(&p).parent().map(|x| x.to_string_lossy().to_string()) {
+                if let Some(&(ie, cs)) = self.show_bounds.get(&dir) {
+                    if ie > 2.0 {
+                        intro = ie;
+                    }
+                    if cs > 2.0 {
+                        credits = cs;
+                    }
+                }
+            }
+        }
+        if credits < 10.0 && self.video_dur_secs > 0.0 {
+            credits = (self.video_dur_secs - self.credits_skip_secs).max(0.0);
+        }
+        (intro, credits)
+    }
+
+    fn maybe_analyze_video(&mut self, path: &str) {
+        if !self.intro_skip_enabled {
+            return;
+        }
+        let known = self
+            .video_bounds
+            .get(path)
+            .map(|b| b.0 > 2.0 || b.1 > 2.0)
+            .unwrap_or(false);
+        if known || self.analyzing_video.contains(path) {
+            return;
+        }
+        self.analyzing_video.insert(path.to_string());
+        let gen = self.video_gen;
+        let _ = self.lib_tx.send(LibCmd::VideoAnalyze { path: path.to_string(), gen });
+        self.set_status(format!("ANALYZE intro/credits: {}", stem(path)));
+    }
+
     fn start_video(&mut self, path: String) {
         if self.video_on {
             let n = self.video_queue.len();
@@ -5088,6 +5389,12 @@ video_ended: false,
     }
 
     fn close_video(&mut self) {
+        if let Some(path) = self.video_current.clone() {
+            if self.video_cur_secs > 3.0 && self.video_dur_secs > 0.0 && self.video_cur_secs < self.video_dur_secs - 5.0 {
+                self.video_positions.insert(path, self.video_cur_secs);
+                self.save_settings();
+            }
+        }
         self.video_closing = true;
         let _ = self.lib_tx.send(LibCmd::VideoClose);
         self.video_on = false;
@@ -5137,7 +5444,13 @@ video_ended: false,
             let vh = ih * scale;
             let img = egui::Rect::from_center_size(scr.center(), egui::vec2(vw, vh));
             let mouse = ctx.input(|i| i.pointer.latest_pos());
-            let hovering = mouse.map_or(false, |m| m.y <= scr.min.y + 34.0 && m.x >= scr.min.x && m.x <= scr.max.x);
+            let queue_region = egui::Rect::from_min_max(
+                egui::pos2(scr.max.x - 300.0, scr.min.y + 32.0),
+                egui::pos2(scr.max.x, scr.max.y),
+            );
+            let hovering = mouse.map_or(false, |m| {
+                (m.y <= scr.min.y + 34.0 && m.x >= scr.min.x && m.x <= scr.max.x) || queue_region.contains(m)
+            });
             self.video_bar_visible = hovering || self.video_queue_pin;
             let mut close = false;
             let mut togg = false;
@@ -5185,9 +5498,56 @@ video_ended: false,
                         if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(448.0, 4.0), egui::vec2(150.0, 22.0)), egui::Button::new(format!("ASPECT {}", self.video_aspect.label()))).clicked() {
                             aspect_cycle = true;
                         }
+                        let skip_lbl = if self.intro_skip_enabled { "SKIP: ON" } else { "SKIP: OFF" };
+                        let skip_color = if self.intro_skip_enabled { Color32::from_rgb(100, 255, 100) } else { Color32::from_gray(160) };
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(606.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(egui::RichText::new(skip_lbl).color(skip_color))).clicked() {
+                            self.intro_skip_enabled = !self.intro_skip_enabled;
+                            self.save_settings();
+                            if self.intro_skip_enabled {
+                                if let Some(p) = self.video_current.clone() {
+                                    self.analyzing_video.remove(&p);
+                                    self.maybe_analyze_video(&p);
+                                }
+                            }
+                        }
+                        let (bie, bcs) = self.video_bound_secs();
+                        let bnd_lbl = if bie > 0.0 || bcs > 0.0 {
+                            format!("INTRO {}", fmt_time(bie))
+                        } else {
+                            "INTRO --".to_string()
+                        };
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(700.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(bnd_lbl)).clicked() {
+                            if let Some(p) = self.video_current.clone() {
+                                let (_, ccs) = self.video_bounds.get(&p).copied().unwrap_or((0.0, bcs));
+                                self.video_bounds.insert(p.clone(), (self.video_cur_secs, ccs));
+                                if let Some(dir) = Path::new(&p).parent().map(|x| x.to_string_lossy().to_string()) {
+                                    let (_, pc) = self.show_bounds.get(&dir).copied().unwrap_or((0.0, 0.0));
+                                    self.show_bounds.insert(dir, (self.video_cur_secs, pc));
+                                }
+                                self.save_settings();
+                                self.set_status(format!("Intro END set at {}", fmt_time(self.video_cur_secs)));
+                            }
+                        }
+                        let crd_lbl = if bcs > 0.0 {
+                            format!("CREDS {}", fmt_time(bcs))
+                        } else {
+                            "CREDS --".to_string()
+                        };
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(794.0, 4.0), egui::vec2(86.0, 22.0)), egui::Button::new(crd_lbl)).clicked() {
+                            if let Some(p) = self.video_current.clone() {
+                                let (iie, _) = self.video_bounds.get(&p).copied().unwrap_or((0.0, 0.0));
+                                self.video_bounds.insert(p.clone(), (iie, self.video_cur_secs));
+                                if let Some(dir) = Path::new(&p).parent().map(|x| x.to_string_lossy().to_string()) {
+                                    let (pi, _) = self.show_bounds.get(&dir).copied().unwrap_or((0.0, 0.0));
+                                    self.show_bounds.insert(dir, (pi, self.video_cur_secs));
+                                }
+                                self.save_settings();
+                                self.set_status(format!("Credits START set at {}", fmt_time(self.video_cur_secs)));
+                            }
+                        }
                         let mut vv = self.video_volume;
                         let vsl = ui.put(
-                            egui::Rect::from_min_size(scr.min + egui::vec2(706.0, 8.0), egui::vec2(170.0, 14.0)),
+                            egui::Rect::from_min_size(scr.min + egui::vec2(890.0, 8.0), egui::vec2(170.0, 14.0)),
                             egui::Slider::new(&mut vv, 0..=200).text("VOL"),
                         );
                         if vsl.changed() {
@@ -5225,8 +5585,23 @@ video_ended: false,
                                     let is_cur = i == self.video_queue_idx && self.video_on;
                                     ui.horizontal(|ui| {
                                         let col = if is_cur { Color32::from_rgb(255, 220, 80) } else { Color32::from_gray(200) };
-                                        let txt = format!("{:02}  {}", i + 1, stem(p));
+                                        let mark = if is_cur { "▶" } else { " " };
+                                        let txt = format!("{} {:02}  {}", mark, i + 1, stem(p));
                                         let label = RichText::new(txt).color(col).monospace().size(11.0);
+                                        if is_cur {
+                                            let row_rect = egui::Rect::from_min_size(
+                                                ui.cursor().min,
+                                                egui::vec2(ui.available_width(), 16.0),
+                                            );
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(qrect.min.x, row_rect.min.y),
+                                                    egui::pos2(qrect.max.x, row_rect.max.y),
+                                                ),
+                                                0.0,
+                                                Color32::from_rgba_unmultiplied(255, 220, 80, 25),
+                                            );
+                                        }
                                         let resp = ui.add(egui::Label::new(label).truncate());
                                         if resp.clicked() {
                                             play_here = Some(i);
