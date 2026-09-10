@@ -2,7 +2,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/embedded_tools.rs"));
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::os::windows::process::CommandExt;
@@ -23,7 +23,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use lofty::prelude::*;
 
 const APP_NAME: &str = "Random Shuffle Player";
-const APP_VERSION: &str = "2026.09.09-C";
+const APP_VERSION: &str = "2.3.0";
 
 const AUDIO_FORMATS: [&str; 16] = [
     "mp3", "wav", "flac", "m4a", "m4b", "m4p", "ogg", "oga", "aac", "aiff", "aif", "wma", "wv", "mpc", "opus", "webm",
@@ -561,6 +561,39 @@ enum DeckMode {
     Radio,
 }
 
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+enum VideoAspect {
+    #[serde(rename = "original")]
+    Original,
+    #[serde(rename = "4:3")]
+    R43,
+    #[serde(rename = "16:9")]
+    R169,
+}
+
+impl VideoAspect {
+    fn label(self) -> &'static str {
+        match self {
+            VideoAspect::Original => "ORIG",
+            VideoAspect::R43 => "4:3",
+            VideoAspect::R169 => "16:9",
+        }
+    }
+    fn next(self) -> VideoAspect {
+        match self {
+            VideoAspect::Original => VideoAspect::R43,
+            VideoAspect::R43 => VideoAspect::R169,
+            VideoAspect::R169 => VideoAspect::Original,
+        }
+    }
+}
+
+impl Default for VideoAspect {
+    fn default() -> Self {
+        VideoAspect::Original
+    }
+}
+
 fn beautify_name(filename: &str) -> String {
     let r1 = BEAUTIFY_RE[0].get_or_init(|| regex::Regex::new(r"^(CD\s?\d+[-]?\s*|\d+[-.]?\s*)+").unwrap());
     let r2 = BEAUTIFY_RE[1].get_or_init(|| regex::Regex::new(r"\s*\([^)]*\)\s*").unwrap());
@@ -626,6 +659,18 @@ struct Settings {
     last_played: Option<String>,
     playlist: Vec<String>,
     theme: String,
+    #[serde(default)]
+    video_aspects: HashMap<String, VideoAspect>,
+    #[serde(default)]
+    video_aspect_default: VideoAspect,
+    #[serde(default = "default_video_volume")]
+    video_volume: u32,
+    #[serde(default)]
+    last_cd_dir: Option<String>,
+}
+
+fn default_video_volume() -> u32 {
+    100
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -796,6 +841,8 @@ enum Msg {
     RecordFail { display: String, err: String },
     VideoFrame { w: u32, h: u32, rgba: Vec<u8> },
     VideoClosed { gen: u64 },
+    VideoPos { gen: u64, secs: f32 },
+    VideoMeta { gen: u64, dur: f32 },
 }
 
 enum LibCmd {
@@ -810,7 +857,7 @@ enum LibCmd {
     Record { display: String, audio: String, dest: String },
     RecordRadio { display: String, url: String, dest: String },
     FindMusicFolder,
-    VideoOpen(String, u64),
+    VideoOpen { path: String, gen: u64, seek: f32 },
     VideoClose,
     VideoPause(bool),
 }
@@ -962,9 +1009,15 @@ fn spawn_radio_stream(url: &str, ffmpeg: &Path) -> Result<(Child, PipeSource), S
     ))
 }
 
-fn spawn_video_audio(path: &str, ffmpeg: &Path) -> Result<(Child, PipeSource), String> {
+fn spawn_video_audio(path: &str, ffmpeg: &Path, seek: f32) -> Result<(Child, PipeSource), String> {
+    let mut args: Vec<String> = vec!["-re".to_string()];
+    if seek > 0.0 {
+        args.push("-ss".to_string());
+        args.push(format!("{:.3}", seek));
+    }
+    args.extend(["-i", path, "-vn", "-ac", "2", "-ar", "44100", "-f", "s16le", "-"].iter().map(|s| s.to_string()));
     let mut child = Command::new(ffmpeg.to_string_lossy().to_string())
-        .args(["-re", "-i", path, "-vn", "-ac", "2", "-ar", "44100", "-f", "s16le", "-"])
+        .args(&args)
         .stdout(std::process::Stdio::piped())
         .creation_flags(NO_WINDOW)
         .spawn()
@@ -974,6 +1027,29 @@ fn spawn_video_audio(path: &str, ffmpeg: &Path) -> Result<(Child, PipeSource), S
         child,
         PipeSource { reader: BufReader::new(stdout), pending: VecDeque::new() },
     ))
+}
+
+fn probe_video_duration(path: &str) -> f32 {
+    let fp = tools_dir().join("ffprobe.exe");
+    if !fp.is_file() {
+        return 0.0;
+    }
+    let out = std::process::Command::new(fp)
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .creation_flags(NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => std::str::from_utf8(&o.stdout).ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(0.0),
+        Err(_) => 0.0,
+    }
+}
+
+fn fmt_time(s: f32) -> String {
+    let s = s.max(0.0) as u64;
+    format!("{:02}:{:02}", s / 60, s % 60)
 }
 
 fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
@@ -1091,24 +1167,28 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                 let folder = find_music_folder();
                 let _ = tx.send(Msg::FolderFound { folder });
             }
-            LibCmd::VideoOpen(path, gen) => {
+            LibCmd::VideoOpen { path, gen, seek } => {
                 if let Some(mut c) = video_child.take() { let _ = c.kill(); }
                 if let Some(t) = video_thread.take() { let _ = t.join(); }
-                let mut child = match std::process::Command::new(ffmpeg_path())
-                    .args(["-hide_banner", "-loglevel", "error", "-i"])
-                    .arg(&path)
+                let mut cmd = std::process::Command::new(ffmpeg_path());
+                cmd.args(["-hide_banner", "-loglevel", "error"]);
+                if seek > 0.0 {
+                    cmd.args(["-ss"]).arg(format!("{:.3}", seek));
+                }
+                cmd.arg("-i").arg(&path)
                     .args(["-an", "-vf", "scale=640:360", "-r", "24", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
-                    .creation_flags(NO_WINDOW)
-                    .spawn()
-                {
+                    .creation_flags(NO_WINDOW);
+                let mut child = match cmd.spawn() {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(Msg::Error(format!("ffmpeg could not start video: {}", e)));
                         return;
                     }
                 };
+                let dur = probe_video_duration(&path);
+                let _ = tx.send(Msg::VideoMeta { gen, dur });
                 if let Some(stdout) = child.stdout.take() {
                     let w = 640u32;
                     let h = 360u32;
@@ -1123,6 +1203,7 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                         let frame_t = std::time::Duration::from_secs_f64(1.0 / fps as f64);
                         let mut next_t = std::time::Instant::now();
                         let mut was_paused = false;
+                        let mut frames: u64 = 0;
                         loop {
                             let paused = pausef.load(std::sync::atomic::Ordering::Relaxed);
                             if paused {
@@ -1148,6 +1229,13 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                             }
                             if tx2.send(Msg::VideoFrame { w, h, rgba }).is_err() {
                                 break;
+                            }
+                            frames += 1;
+                            if frames % 24 == 0 {
+                                let secs = seek + frames as f32 / fps;
+                                if tx2.send(Msg::VideoPos { gen, secs }).is_err() {
+                                    break;
+                                }
                             }
                             next_t += frame_t;
                         }
@@ -1728,6 +1816,9 @@ struct PlayerApp {
     art_state: u8,
     art_local_valid: bool,
     display_cache: Vec<String>,
+    playlist_scroll: f32,
+    pl_view_h: f32,
+    playing_pl_idx: Option<usize>,
     search_query: String,
     yt_query: String,
     eq_pending: Option<String>,
@@ -1746,6 +1837,7 @@ struct PlayerApp {
     running: String,
     fullscreen: bool,
     fs_asserted: bool,
+    video_fs_restore_app: bool,
     tape_anim: f32,
     tape_out: bool,
     tape_reversing: bool,
@@ -1767,13 +1859,14 @@ struct PlayerApp {
     fade_start: Instant,
     fade_from_vol: u32,
     show_help: bool,
-    show_eq: bool,
     search_focus: bool,
     yt_focus: bool,
     eq_on: bool,
     eq_custom: Option<[f32; 10]>,
     lyrics: Option<String>,
     lyrics_title: String,
+    viz_bars: Vec<f32>,
+    viz_peaks: Vec<f32>,
     want_web: bool,
     last_drop: Vec<PathBuf>,
     drag_from: Option<usize>,
@@ -1797,6 +1890,7 @@ struct PlayerApp {
     radio_last_start: Instant,
     disc_in: bool,
     disc_label: String,
+    last_cd_dir: Option<String>,
     disc_saved: Vec<String>,
     band_map: HashMap<String, Vec<String>>,
     full_library: Vec<String>,
@@ -1815,6 +1909,16 @@ struct PlayerApp {
     video_queue_idx: usize,
     video_gen: u64,
     video_closing: bool,
+    video_aspect: VideoAspect,
+    video_dur_secs: f32,
+    video_cur_secs: f32,
+    video_seek_t: Option<f32>,
+    video_current: Option<String>,
+    video_ended: bool,
+    video_aspects: HashMap<String, VideoAspect>,
+    video_aspect_default: VideoAspect,
+    video_volume: u32,
+    deck_resume: Option<(String, f32)>,
     video_queue_pin: bool,
     random_on: bool,
     switch_accum: f32,
@@ -1832,6 +1936,10 @@ impl PlayerApp {
         let history_path = data_dir().join("history.json");
 
         let mut state = PlayerState::default();
+        let mut video_aspects: HashMap<String, VideoAspect> = HashMap::new();
+        let mut video_aspect_default = VideoAspect::Original;
+        let mut video_volume = 100;
+        let mut last_cd_dir: Option<String> = None;
         if let Ok(text) = std::fs::read_to_string(&settings_path) {
             if let Ok(s) = serde_json::from_str::<Settings>(&text) {
                 state.volume = s.volume.clamp(0, 100);
@@ -1839,6 +1947,10 @@ impl PlayerApp {
                 state.playlist = s.playlist;
                 state.playlist.sort_by_key(|p| song_sort_key(p));
                 if !s.theme.is_empty() { state.theme = s.theme; }
+                video_aspects = s.video_aspects;
+                video_aspect_default = s.video_aspect_default;
+                video_volume = s.video_volume.clamp(0, 200);
+                last_cd_dir = s.last_cd_dir.filter(|d| Path::new(d).is_dir());
             }
         }
         if let Ok(text) = std::fs::read_to_string(&history_path) {
@@ -1899,6 +2011,9 @@ impl PlayerApp {
             art_state: 0,
             art_local_valid: false,
             display_cache,
+            playlist_scroll: 0.0,
+            pl_view_h: 300.0,
+            playing_pl_idx: None,
             search_query: String::new(),
             yt_query: String::new(),
             eq_pending: None,
@@ -1917,6 +2032,7 @@ impl PlayerApp {
             running: String::new(),
             fullscreen: true,
             fs_asserted: false,
+            video_fs_restore_app: false,
             tape_anim: 0.0,
             tape_out: false,
             tape_reversing: false,
@@ -1942,6 +2058,7 @@ impl PlayerApp {
             radio_last_start: Instant::now(),
             disc_in: false,
             disc_label: String::new(),
+            last_cd_dir,
             disc_saved: Vec::new(),
             band_map,
             full_library,
@@ -1959,6 +2076,16 @@ impl PlayerApp {
             video_queue_idx: 0,
             video_gen: 0,
             video_closing: false,
+            video_aspect: VideoAspect::Original,
+            video_dur_secs: 0.0,
+            video_cur_secs: 0.0,
+            video_seek_t: None,
+            video_current: None,
+video_ended: false,
+        video_aspects,
+        video_aspect_default,
+        video_volume,
+        deck_resume: None,
             video_queue_pin: false,
             random_on: true,
             switch_accum: 0.0,
@@ -1973,13 +2100,14 @@ impl PlayerApp {
             fade_start: Instant::now(),
             fade_from_vol: 50,
             show_help: false,
-            show_eq: false,
             search_focus: false,
             yt_focus: false,
             eq_on: false,
             eq_custom: None,
             lyrics: None,
             lyrics_title: String::new(),
+            viz_bars: vec![2.0; 12],
+            viz_peaks: vec![0.0; 12],
             want_web: false,
             last_drop: Vec::new(),
             drag_from: None,
@@ -2000,6 +2128,10 @@ impl PlayerApp {
             last_played: self.state.current_song.clone(),
             playlist: self.state.playlist.clone(),
             theme: self.state.theme.clone(),
+            video_aspects: self.video_aspects.clone(),
+            video_aspect_default: self.video_aspect_default,
+            video_volume: self.video_volume,
+            last_cd_dir: self.last_cd_dir.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&s) {
             let _ = std::fs::write(&self.settings_path, text);
@@ -2097,6 +2229,7 @@ impl PlayerApp {
                     self.state.song_count = 0;
                     self.state.skip_count = 0;
                     self.state.start_time = Some(Instant::now());
+                    self.playing_pl_idx = None;
                     self.rebuild_display_cache();
                     if self.state.playlist.is_empty() {
                         self.set_status("No songs found");
@@ -2292,13 +2425,23 @@ impl PlayerApp {
                 Msg::VideoClosed { gen } => {
                     let was_eof = gen == self.video_gen && !self.video_closing;
                     if was_eof {
-                        self.video_on = false;
-                        self.video_bar_visible = false;
                         if !self.video_queue.is_empty() {
                             self.queue_next();
                         } else {
-                            self.video_tex = None;
+                            self.video_ended = true;
+                            self.video_paused = true;
+                            self.set_status("MOVIE: end - PLAY to replay");
                         }
+                    }
+                }
+                Msg::VideoPos { gen, secs } => {
+                    if gen == self.video_gen {
+                        self.video_cur_secs = secs;
+                    }
+                }
+                Msg::VideoMeta { gen, dur } => {
+                    if gen == self.video_gen {
+                        self.video_dur_secs = dur;
                     }
                 }
             }
@@ -2508,31 +2651,40 @@ impl PlayerApp {
         }
         let pl = self.state.playlist.clone();
         let weights: HashMap<String, f32> = self.state.song_weights.clone();
-        let song = if self.disc_in {
+        let (song, mut idx) = if self.disc_in {
             let i = self.state.current_song.as_ref().and_then(|c| pl.iter().position(|p| p == c)).unwrap_or(0);
-            pl[(i + 1) % pl.len()].clone()
+            let ni = (i + 1) % pl.len();
+            (pl[ni].clone(), Some(ni))
         } else if self.state.playlist_only_mode && self.state.playlist_only_sequential {
-            pl[self.state.song_count as usize % pl.len()].clone()
+            let ni = self.state.song_count as usize % pl.len();
+            (pl[ni].clone(), Some(ni))
         } else if !self.random_on {
             let i = self.state.current_song.as_ref().and_then(|c| pl.iter().position(|p| p == c)).unwrap_or(0);
-            pl[(i + 1) % pl.len()].clone()
+            let ni = (i + 1) % pl.len();
+            (pl[ni].clone(), Some(ni))
         } else if self.state.playlist_only_mode {
-            random_next(self.state.current_song.as_deref(), &pl, &weights)
+            (random_next(self.state.current_song.as_deref(), &pl, &weights), None)
         } else if self.state.dir_sequential {
             if let Some(dir) = self.state.current_dir.clone() {
                 let files = collect_audio(&dir);
                 if !files.is_empty() {
-                    files[self.state.song_count as usize % files.len()].clone()
+                    let picked = files[self.state.song_count as usize % files.len()].clone();
+                    let pi = pl.iter().position(|p| *p == picked);
+                    (picked, pi)
                 } else {
-                    random_next(self.state.current_song.as_deref(), &pl, &weights)
+                    (random_next(self.state.current_song.as_deref(), &pl, &weights), None)
                 }
             } else {
-                random_next(self.state.current_song.as_deref(), &pl, &weights)
+                (random_next(self.state.current_song.as_deref(), &pl, &weights), None)
             }
         } else {
-            random_next(self.state.current_song.as_deref(), &pl, &weights)
+            (random_next(self.state.current_song.as_deref(), &pl, &weights), None)
         };
+        if idx.is_none() {
+            idx = pl.iter().position(|p| *p == song);
+        }
         self.state.skip_count += 1;
+        self.playing_pl_idx = idx;
         self.play_song(&song);
     }
 
@@ -2542,7 +2694,9 @@ impl PlayerApp {
         }
         let pl = self.state.playlist.clone();
         let i = self.state.current_song.as_ref().and_then(|c| pl.iter().position(|p| p == c)).unwrap_or(0);
-        let prev = pl[(i + pl.len() - 1) % pl.len()].clone();
+        let pi = (i + pl.len() - 1) % pl.len();
+        let prev = pl[pi].clone();
+        self.playing_pl_idx = Some(pi);
         self.play_song(&prev);
     }
 
@@ -2580,6 +2734,68 @@ impl PlayerApp {
         self.winding = None;
         self.wind_arm = None;
         self.wind_playing = false;
+    }
+
+    fn resume_tape(&mut self, path: &str, pos: f32) {
+        let pos = pos.max(0.0);
+        self.eq_resume = Some(Duration::from_secs_f32(pos));
+        self.state.is_paused = false;
+        self.state.current_song = Some(path.to_string());
+        self.playing_pl_idx = self.state.playlist.iter().position(|p| p == path);
+        self.playing = Self::playing_display(path);
+        self.do_play(path, path);
+        self.set_status(format!("TAPE resumed: {}", stem(path)));
+    }
+
+    fn set_deck_mode(&mut self, m: DeckMode) {
+        if self.deck_mode == m {
+            if m != DeckMode::Tape {
+                return;
+            }
+            if self.play_started.is_none() && !self.radio_on {
+                self.stop_radio();
+                if let Some((path, pos)) = self.deck_resume.take() {
+                    if Path::new(&path).is_file() {
+                        self.resume_tape(&path, pos);
+                        return;
+                    }
+                }
+                if let Some(cur) = self.state.current_song.clone() {
+                    if Path::new(&cur).is_file() {
+                        self.resume_tape(&cur, 0.0);
+                    }
+                }
+            }
+            return;
+        }
+        if m == DeckMode::Tape {
+            let from_disc = self.deck_mode == DeckMode::Disc;
+            self.stop_radio();
+            self.deck_mode = m;
+            if from_disc {
+                self.disc_in = false;
+                self.disc_label = String::new();
+                self.state.playlist = self.all_songs_ordered();
+                self.playing_pl_idx = None;
+                self.rebuild_display_cache();
+                self.save_settings();
+            }
+            if let Some((path, pos)) = self.deck_resume.take() {
+                if Path::new(&path).is_file() {
+                    self.resume_tape(&path, pos);
+                }
+            }
+            return;
+        }
+        if self.deck_mode == DeckMode::Tape {
+            if let Some(cur) = self.state.current_song.clone() {
+                if Path::new(&cur).is_file() {
+                    self.deck_resume = Some((cur, self.pos.max(0.0)));
+                }
+            }
+        }
+        self.stop_radio();
+        self.deck_mode = m;
     }
 
     fn radio_band_range(&self) -> (f32, f32) {
@@ -2746,12 +2962,19 @@ impl PlayerApp {
     }
 
     fn insert_disc(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(d) = self.last_cd_dir.clone() {
+            if Path::new(&d).is_dir() {
+                dialog = dialog.set_directory(d);
+            }
+        }
+        if let Some(dir) = dialog.pick_folder() {
             let files = collect_audio(&dir.to_string_lossy());
             if files.is_empty() {
                 self.set_error("No audio in that folder");
                 return;
             }
+            self.last_cd_dir = Some(dir.to_string_lossy().to_string());
             self.disc_saved = self.state.playlist.clone();
             self.state.playlist = files;
             self.rebuild_display_cache();
@@ -2780,6 +3003,7 @@ impl PlayerApp {
             self.state.playlist = self.disc_saved.clone();
         }
         self.state.current_song = None;
+        self.playing_pl_idx = None;
         self.stop_music();
         if self.radio_on {
             self.stop_radio();
@@ -2940,17 +3164,43 @@ impl PlayerApp {
         });
     }
 
+    fn all_songs_ordered(&self) -> Vec<String> {
+        let mut band_names: Vec<String> = self.band_map.keys().cloned().collect();
+        band_names.sort_by_key(|b| b.to_lowercase());
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ordered: Vec<(String, String)> = Vec::new();
+        for b in band_names {
+            if let Some(v) = self.band_map.get(&b) {
+                let mut songs = v.clone();
+                songs.sort_by_key(|p| song_sort_key(p));
+                for s in songs {
+                    if seen.insert(s.clone()) {
+                        ordered.push((b.clone(), s));
+                    }
+                }
+            }
+        }
+        for f in self.full_library.iter() {
+            if seen.insert(f.clone()) {
+                ordered.push((band_of(f), f.clone()));
+            }
+        }
+        ordered.sort_by_key(|(b, _)| b.to_lowercase());
+        ordered.into_iter().map(|(_, s)| s).collect()
+    }
+
     fn choose_band(&mut self, band: String) {
         self.band_sel = band.clone();
         self.disc_in = false;
         self.state.playlist = if band.is_empty() {
-            self.full_library.clone()
+            self.all_songs_ordered()
         } else if let Some(v) = self.band_map.get(&band) {
-            v.clone()
+            let mut songs = v.clone();
+            songs.sort_by_key(|p| song_sort_key(p));
+            songs
         } else {
             Vec::new()
         };
-        self.state.playlist.sort_by_key(|p| song_sort_key(p));
         self.rebuild_display_cache();
         self.save_settings();
         self.set_status(
@@ -3359,27 +3609,32 @@ impl PlayerApp {
             )
         });
         if !focused {
-            if space { self.toggle_pause(); }
-            if right {
-                if shift { self.skip_forward(); } else { self.skip_song(); }
+            if self.video_on {
+                if space { self.toggle_video_play(); }
+                if left { self.seek_video((self.video_cur_secs - 5.0).max(0.0)); }
+                if right { self.seek_video((self.video_cur_secs + 5.0).min((self.video_dur_secs - 1.0).max(0.0))); }
+            } else {
+                if space { self.toggle_pause(); }
+                if right {
+                    if shift { self.skip_forward(); } else { self.skip_song(); }
+                }
+                if left {
+                    if shift { self.skip_backward(); } else { self.prev_song(); }
+                }
+                if up { self.increase_volume(); }
+                if down { self.decrease_volume(); }
             }
-            if left {
-                if shift { self.skip_backward(); } else { self.prev_song(); }
-            }
-            if up { self.increase_volume(); }
-            if down { self.decrease_volume(); }
         }
         if f { self.toggle_fullscreen(); }
         if alt_enter {
             if self.video_on {
-                self.video_fs = !self.video_fs;
-                self.video_pos = egui::pos2(60.0, 60.0);
+                self.set_video_fs(!self.video_fs);
             } else {
                 self.toggle_fullscreen();
             }
         }
         if esc && self.fullscreen { self.set_fullscreen(false); }
-        if esc && self.video_fs { self.video_fs = false; }
+        if esc && self.video_fs { self.set_video_fs(false); }
         if f10 {
             let ctx = self.ctx.clone();
             self.request_quit(&ctx);
@@ -3391,7 +3646,7 @@ impl PlayerApp {
                 _ => None,
             }).flatten().collect()
         });
-        if !focused {
+        if !focused && !self.video_on {
             for c in chars {
                 match c {
                     '+' | '=' => self.increase_volume(),
@@ -3417,7 +3672,31 @@ impl PlayerApp {
 
     fn set_fullscreen(&mut self, on: bool) {
         self.fullscreen = on;
-        self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        if on {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        } else {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+
+    fn set_video_fs(&mut self, on: bool) {
+        if on && !self.video_fs {
+            if !self.fullscreen {
+                self.video_fs_restore_app = true;
+                self.set_fullscreen(true);
+            } else {
+                self.video_fs_restore_app = false;
+            }
+        }
+        if !on && self.video_fs && self.video_fs_restore_app {
+            self.video_fs_restore_app = false;
+            self.set_fullscreen(false);
+        }
+        self.video_fs = on;
+        if !on {
+            self.video_pos = egui::pos2(60.0, 60.0);
+        }
     }
 
     fn draw_sleep_timer(&mut self, ctx: &egui::Context) {
@@ -3450,6 +3729,33 @@ impl PlayerApp {
             }
         } else {
             self.status.clone()
+        }
+    }
+
+    fn update_viz(&mut self, dt: f32) {
+        let t = self.ctx.input(|i| i.time) as f32;
+        let vh = 76.0;
+        for i in 0..self.viz_bars.len() {
+            let x = i as f32;
+            let mut h = 0.0;
+            h += (t * 1.7 + x * 0.83).sin().abs() * 0.30;
+            h += (t * 3.4 + x * 1.37).sin().abs() * 0.24;
+            h += (t * 5.9 + x * 2.21).sin().abs() * 0.18;
+            let bass = if x < 4.0 { (t * 2.05 + x * 0.3).sin().abs() * 0.22 } else { 0.0 };
+            let mut target = (h + bass + 0.08) * vh * 1.25;
+            if target < 3.0 {
+                target = 3.0;
+            }
+            let cur = self.viz_bars[i];
+            let k = if target > cur { 1.0 - (-dt * 16.0).exp() } else { 1.0 - (-dt * 5.5).exp() };
+            let next = cur + (target - cur) * k;
+            self.viz_bars[i] = next.max(2.0).min(vh);
+            let peak = self.viz_peaks[i];
+            if next > peak {
+                self.viz_peaks[i] = next;
+            } else {
+                self.viz_peaks[i] = (peak - dt * 9.0).max(0.0);
+            }
         }
     }
 
@@ -3488,10 +3794,6 @@ impl PlayerApp {
                         egui::FontId::monospace(13.0),
                         th.playing_fg,
                     );
-                }
-                ui.label(RichText::new("EQ: DISABLED").color(th.btn_fg).monospace().size(11.0));
-                if retro_btn(ui, "EQ", if self.show_eq { Color32::from_rgb(255, 240, 160) } else { th.btn_fg }, th.btn_bg).on_hover_text("EQ is disabled: it caused playback problems (video stuck loading). Forced to Flat.").clicked() {
-                    self.show_eq = !self.show_eq;
                 }
             });
             ui.horizontal(|ui| {
@@ -3568,35 +3870,56 @@ impl PlayerApp {
                 ui.label(RichText::new(&self.playing).color(th.playing_fg).monospace().size(12.0));
             });
 
-            let t = ui.ctx().input(|i| i.time) as f32;
-            let bars = visualizer_bars(t);
-            let (vrect, _) = ui.allocate_exact_size(egui::vec2(168.0, 58.0), egui::Sense::hover());
+            let dt = ui.input(|i| i.stable_dt);
+            self.update_viz(dt);
+            let (vrect, _) = ui.allocate_exact_size(egui::vec2(200.0, 96.0), egui::Sense::hover());
             let painter = ui.painter().with_clip_rect(vrect);
             engrave(&painter, vrect, th.btn_bg);
             painter.rect_filled(vrect.shrink(2.0), 2.0, th.art_bg);
-            let vr = vrect.shrink(6.0);
+            let vr = vrect.shrink(10.0);
             engrave(&painter, egui::Rect::from_min_max(vr.min - egui::vec2(2.0, 2.0), vr.max + egui::vec2(2.0, 2.0)), th.art_bg);
-            for (i, h) in bars.iter().enumerate() {
-                let c = match self.state.theme.as_str() {
-                    "Winamp" => [th.playing_fg, th.accent, Color32::from_rgb(255, 240, 160)][i % 3],
-                    "Matrix" => [th.fg, th.accent, Color32::WHITE][i % 3],
-                    "Cyberpunk" => [th.fg, th.accent, Color32::from_rgb(255, 0, 255)][i % 3],
-                    _ => th.fg,
-                };
-                painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(vr.min.x + i as f32 * 14.0, vr.max.y - h.max(1.0)),
-                        egui::pos2(vr.min.x + i as f32 * 14.0 + 10.0, vr.max.y),
-                    ),
-                    1.0,
-                    c,
+            let segs: usize = 12;
+            let seg_h = vr.height() / segs as f32;
+            let grid_col = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+            for s in 1..segs {
+                let y = vr.max.y - s as f32 * seg_h;
+                painter.line_segment(
+                    [egui::pos2(vr.min.x, y), egui::pos2(vr.max.x, y)],
+                    egui::Stroke::new(1.0, grid_col),
                 );
             }
-            grill_dots(&painter, vr, Color32::from_rgba_unmultiplied(0, 0, 0, 70));
+            let bw = 11.0f32;
+            let pitch = 15.0f32;
+            let ox = vr.min.x + 2.0;
+            for (i, &h) in self.viz_bars.iter().enumerate() {
+                let x = ox + i as f32 * pitch;
+                let lit = (segs as f32 * (h / vr.height()).clamp(0.0, 1.0)).round() as usize;
+                for s in 0..segs {
+                    let f = (s + 1) as f32 / segs as f32;
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(x, vr.max.y - f * vr.height()),
+                        egui::pos2(x + bw, vr.max.y - f * vr.height() + seg_h),
+                    );
+                    let c = if s < lit {
+                        if f > 0.78 { Color32::from_rgb(255, 70, 70) }
+                        else if f > 0.58 { Color32::from_rgb(255, 170, 60) }
+                        else if f > 0.38 { Color32::from_rgb(255, 220, 90) }
+                        else { Color32::from_rgb(70, 230, 110) }
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                    };
+                    painter.rect_filled(r, 1.0, c);
+                }
+                let ph = self.viz_peaks[i].min(vr.height()).max(0.0);
+                let py = vr.max.y - ph;
+                let pr = egui::Rect::from_min_size(egui::pos2(x - 1.0, py - 1.5), egui::vec2(bw + 2.0, 3.0));
+                painter.rect_filled(pr, 1.5, Color32::from_rgb(240, 244, 255));
+            }
+            grill_dots(&painter, vr, Color32::from_rgba_unmultiplied(0, 0, 0, 40));
             ui.add_space(4.0);
             let playing_now = self.state.current_song.is_some() && !self.state.is_paused;
-            let bass = bars[0].max(bars[1]);
-            let pulse = if playing_now { ((bass - 5.0) / 31.0).clamp(0.0, 1.0).powf(0.7) } else { 0.0 };
+            let bass = self.viz_bars[0].max(self.viz_bars[1]);
+            let pulse = if playing_now { ((bass - 8.0) / 68.0).clamp(0.0, 1.0).powf(1.2) } else { 0.0 };
             ui.horizontal(|ui| {
                 speaker_woofer(ui, 76.0, th.btn_bg, th.accent, pulse);
                 ui.add_space(10.0);
@@ -3624,9 +3947,10 @@ impl PlayerApp {
             let mut bands: Vec<String> = self.band_map.keys().cloned().collect();
             bands.sort_by_key(|b| b.to_lowercase());
             let mut sel = self.band_sel.clone();
+            let mut all_clicked = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("BANDS (A-Z)").color(darken(th.accent, 0.35)).monospace().size(8.0));
-                if retro_btn(ui, "All", if sel.is_empty() { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() { sel = String::new(); }
+                if retro_btn(ui, "All", if sel.is_empty() { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() { sel = String::new(); all_clicked = true; }
                 if retro_btn(ui, "Clear Bands", th.btn_fg, th.btn_bg).clicked() {
                     self.clear_bands();
                     sel = String::new();
@@ -3659,8 +3983,8 @@ impl PlayerApp {
                             }
                         }
                     });
-                if self.band_sel != sel {
-                    self.choose_band(sel);
+                if all_clicked || self.band_sel != sel {
+                    self.choose_band(if all_clicked { String::new() } else { sel });
                 }
             }
             ui.add_space(4.0);
@@ -3694,6 +4018,11 @@ impl PlayerApp {
     fn draw_central(&mut self, ui: &mut egui::Ui) {
         let th = self.theme_colors();
         egui::CentralPanel::default().show(ui, |ui| {
+            let bg_rect = ui.available_rect_before_wrap();
+            let bg = ui.interact(bg_rect, ui.id().with("bg_dbl_click"), egui::Sense::click());
+            if bg.double_clicked() && !self.video_on {
+                self.toggle_fullscreen();
+            }
             let playing = self.state.current_song.is_some() && !self.state.is_paused;
             let (deck_plaque, deck_plaque_fg) = match self.deck_mode {
                 DeckMode::Tape => ("  CASSETTE DECK  •  REV C", th.accent),
@@ -3945,6 +4274,7 @@ impl PlayerApp {
                             self.pos = p;
                             self.dragging = true;
                         } else if self.dragging && dial.drag_stopped() {
+                            self.set_status(format!("TUNE seek | pos={:.1} len={:.1} song={}", p, self.len_secs, self.state.current_song.as_deref().unwrap_or("NONE")));
                             self.dragging = false;
                             self.seek_to(p);
                             self.pos = p;
@@ -3984,7 +4314,7 @@ impl PlayerApp {
                 for (m, lbl) in modes {
                     let on = self.deck_mode == m;
                     if retro_btn(ui, lbl, if on { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() {
-                        self.deck_mode = m;
+                        self.set_deck_mode(m);
                     }
                 }
             });
@@ -3996,6 +4326,10 @@ impl PlayerApp {
                 let rec_red = Color32::from_rgb(205, 45, 45);
                 let wn = ui.input(|i| i.time);
                 let rew = deck_key(ui, "REW", th.btn_fg, th.btn_bg);
+                if rew.clicked() {
+                    self.seek_skip(-10.0);
+                    self.set_status(format!("REW click -10s | pos={:.1}", self.pos));
+                }
                 if rew.drag_started() {
                     self.wind_arm = Some((-1.0, wn));
                 }
@@ -4003,6 +4337,10 @@ impl PlayerApp {
                     if self.state.is_paused { self.unpause_music(); } else { self.pause_music(); }
                 }
                 let fwd = deck_key(ui, "FWD", th.btn_fg, th.btn_bg);
+                if fwd.clicked() {
+                    self.seek_skip(10.0);
+                    self.set_status(format!("FWD click +10s | pos={:.1}", self.pos));
+                }
                 if fwd.drag_started() {
                     self.wind_arm = Some((1.0, wn));
                 }
@@ -4126,14 +4464,11 @@ impl PlayerApp {
                 }
                 if retro_btn(ui, "Lyrics", th.btn_fg, th.btn_bg).clicked() { self.fetch_lyrics(); }
                 if retro_btn(ui, "Help", th.btn_fg, th.btn_bg).clicked() { self.show_help = true; }
-                if retro_btn(ui, "Radio", if self.deck_mode == DeckMode::Radio || self.radio_on { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() { self.deck_mode = if self.deck_mode == DeckMode::Radio { DeckMode::Tape } else { DeckMode::Radio }; }
             });
 
             ui.horizontal_wrapped(|ui| {
                 if retro_btn(ui, &format!("Theme: {}", self.state.theme), th.playing_fg, th.btn_bg).clicked() { self.cycle_theme(); }
-                if retro_btn(ui, "EQ: DISABLED (FLAT)", th.btn_fg, th.btn_bg).on_hover_text("EQ is disabled: it caused playback problems (video stuck on LOADING, wrong metadata). Preset is forced to Flat. May be re-enabled in a future build.").clicked() {
-                    self.show_eq = !self.show_eq;
-                }
+                ui.label(RichText::new("EQ: DISABLED").color(darken(th.btn_fg, 0.35)).monospace().size(11.0));
                 ui.separator();
                 ui.label(RichText::new("Sleep:").color(th.fg).monospace().size(11.0));
                 ui.add(egui::TextEdit::singleline(&mut self.sleep_input).desired_width(46.0).font(egui::TextStyle::Monospace).text_color(th.playing_fg));
@@ -4144,14 +4479,6 @@ impl PlayerApp {
                 let sleep_label = if self.sleep_minutes > 0 { format!("Timer: {}m", self.sleep_minutes) } else { "Timer: Off".to_string() };
                 lcd(ui, &sleep_label, if self.sleep_minutes > 0 { th.playing_fg } else { th.btn_fg }, th.bg);
             });
-
-            if self.show_eq {
-                ui.group(|ui| {
-                    ui.label(RichText::new("EQ is DISABLED").color(th.playing_fg).monospace().strong().size(12.0));
-                    ui.label(RichText::new("The equalizer forced to Flat because it caused playback problems: videos would get stuck on LOADING and metadata went wrong.").color(th.btn_fg).monospace().size(10.0));
-                    ui.label(RichText::new("It may be re-enabled in a future build after the background EQ encode is reworked.").color(th.btn_fg).monospace().size(10.0));
-                });
-            }
 
             ui.separator();
 
@@ -4208,7 +4535,10 @@ impl PlayerApp {
             });
 
             let query = self.search_query.to_lowercase();
-            let cur = self.state.current_song.clone();
+            let cur_song = self.state.current_song.clone();
+            let cur_idx = self.playing_pl_idx
+                .filter(|i| *i < self.state.playlist.len())
+                .or_else(|| cur_song.as_deref().and_then(|c| self.state.playlist.iter().position(|p| p.as_str() == c)));
             let rows: Vec<(usize, String)> = self
                 .state
                 .playlist
@@ -4227,38 +4557,17 @@ impl PlayerApp {
 
             let mut play_choice: Option<usize> = None;
             let row_h = 20.0;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show_rows(ui, row_h, rows.len(), |ui, range| {
+            let sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            sa.show_rows(ui, row_h, rows.len(), |ui, range| {
                     for i in range {
                         let (idx, disp) = &rows[i];
-                        let is_current = cur.as_deref() == Some(self.state.playlist[*idx].as_str());
+                        let is_current = cur_idx == Some(*idx);
                         let color = if is_current { th.playing_fg } else { th.fg };
-                        let mark = if is_current { ">" } else { " " };
-                        if is_current {
-                            let r = egui::Rect::from_min_size(
-                                ui.cursor().min + egui::vec2(0.0, 1.0),
-                                egui::vec2(ui.available_width(), row_h),
-                            );
-                            ui.painter().rect_filled(
-                                r.shrink2(egui::vec2(0.0, 2.0)),
-                                3.0,
-                                Color32::from_rgba_unmultiplied(th.accent.r(), th.accent.g(), th.accent.b(), 46),
-                            );
-                        }
+                        let mark = if is_current { "▶" } else { " " };
                         let rich = RichText::new(format!("{} {:>3}  {}", mark, idx + 1, disp))
                             .color(color)
-                            .monospace()
-                            .strong();
-                        let resp = ui.selectable_label(false, rich);
-                        if is_current {
-                            let r = resp.rect;
-                            ui.painter().vline(
-                                r.left() + 1.0,
-                                r.top() + 4.0..=r.bottom() - 4.0,
-                                egui::Stroke::new(3.0, th.playing_fg),
-                            );
-                        }
+                            .monospace();
+                        let resp = ui.selectable_label(is_current, rich);
                         if resp.clicked() && self.drag_from.is_none() {
                             play_choice = Some(*idx);
                         }
@@ -4294,6 +4603,7 @@ impl PlayerApp {
                 });
             if let Some(i) = play_choice {
                 let p = self.state.playlist[i].clone();
+                self.playing_pl_idx = Some(i);
                 self.play_song(&p);
             }
 
@@ -4498,31 +4808,72 @@ impl PlayerApp {
         egui::Window::new("SYSTEM MANUAL")
             .resizable(true)
             .collapsible(false)
-            .default_width(450.0)
+            .default_width(520.0)
             .show(ctx, |ui| {
-                let text = "[ OPERATIONAL COMMANDS ]
-------------------------
-SPACE   : Play / Pause
-LEFT    : Previous Track
-RIGHT   : Skip Track
-S       : Smart Shuffle
-T       : Cycle Theme
-F       : Toggle Fullscreen
-UP/DOWN : Volume Control
-+ / -  : Volume Buttons
-
-[ PLAYLIST ]
-----------
-Click   : Play Selected
-Drag    : Add Files/Folders
-
-[ FEATURES ]
------------
-Sleep   : Auto-close timer
-Look Up : Open song folder
-EQ      : Equalizer presets";
-                ui.label(RichText::new(text).color(Color32::from_rgb(0, 255, 0)).monospace());
                 let th = self.theme_colors();
+                let g = Color32::from_rgb(0, 255, 0);
+                let dim = Color32::from_rgb(100, 200, 100);
+                let acc = th.accent;
+
+                ui.label(RichText::new("KEYBOARD SHORTCUTS").color(acc).monospace().strong());
+                ui.label(RichText::new("SPACE .............. Play / Pause").color(g).monospace());
+                ui.label(RichText::new("LEFT ................ Previous Track").color(g).monospace());
+                ui.label(RichText::new("RIGHT ............... Skip / Next Track").color(g).monospace());
+                ui.label(RichText::new("UP .................. Volume Up").color(g).monospace());
+                ui.label(RichText::new("DOWN ................ Volume Down").color(g).monospace());
+                ui.label(RichText::new("+  /  - ............. Volume Buttons").color(g).monospace());
+                ui.label(RichText::new("S ................... Smart Shuffle (toggle)").color(g).monospace());
+                ui.label(RichText::new("T ................... Cycle Theme").color(g).monospace());
+                ui.label(RichText::new("F ................... Toggle Fullscreen").color(g).monospace());
+                ui.label(RichText::new("M ................... Mute / Unmute").color(g).monospace());
+                ui.label(RichText::new("L ................... Toggle Lyrics").color(g).monospace());
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("DECK CONTROLS (TAPE MODE)").color(acc).monospace().strong());
+                ui.label(RichText::new("PLAY ................ Start / Pause playback").color(dim).monospace());
+                ui.label(RichText::new("STOP ................ Stop playback").color(dim).monospace());
+                ui.label(RichText::new("PAUSE ............... Pause playback").color(dim).monospace());
+                ui.label(RichText::new("REW ................. Press & hold to rewind").color(dim).monospace());
+                ui.label(RichText::new("FWD ................. Press & hold to fast-forward").color(dim).monospace());
+                ui.label(RichText::new("SKIP ................ Next track").color(dim).monospace());
+                ui.label(RichText::new("PREV ................ Previous track").color(dim).monospace());
+                ui.label(RichText::new("REC ................. Record to file").color(dim).monospace());
+                ui.label(RichText::new("EJECT ............... Insert / Eject tape").color(dim).monospace());
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("DECK CONTROLS (CD MODE)").color(acc).monospace().strong());
+                ui.label(RichText::new("INSERT DISC ......... Load music from folder").color(dim).monospace());
+                ui.label(RichText::new("EJECT DISC .......... Remove disc").color(dim).monospace());
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("DECK CONTROLS (RADIO MODE)").color(acc).monospace().strong());
+                ui.label(RichText::new("FM / AM ............. Switch band").color(dim).monospace());
+                ui.label(RichText::new("TUNE- / TUNE+ ........ Step frequency").color(dim).monospace());
+                ui.label(RichText::new("SCAN ................ Auto-scan for stations").color(dim).monospace());
+                ui.label(RichText::new("Click dial .......... Tune to frequency").color(dim).monospace());
+                ui.label(RichText::new("Drag dial ........... Sweep frequencies").color(dim).monospace());
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("TUNE SLIDER").color(acc).monospace().strong());
+                ui.label(RichText::new("Drag seek bar to scrub through the current song").color(dim).monospace());
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("PLAYLIST").color(acc).monospace().strong());
+                ui.label(RichText::new("Click row ........... Play selected song").color(dim).monospace());
+                ui.label(RichText::new("Drag & drop ......... Add files or folders").color(dim).monospace());
+                ui.label(RichText::new("Band buttons ......... Filter by artist").color(dim).monospace());
+                ui.label(RichText::new("ALL .................. Show all songs (A-Z)").color(dim).monospace());
+                ui.label(RichText::new("Search bar ........... Filter playlist").color(dim).monospace());
+                ui.add_space(6.0);
+
+                ui.label(RichText::new("EXTRAS").color(acc).monospace().strong());
+                ui.label(RichText::new("Sleep Timer .......... Auto-close after time").color(dim).monospace());
+                ui.label(RichText::new("Look Up ............. Open song folder in explorer").color(dim).monospace());
+                ui.label(RichText::new("EQ .................. Equalizer presets").color(dim).monospace());
+                ui.label(RichText::new("YouTube Download ..... Paste URL in status bar").color(dim).monospace());
+                ui.label(RichText::new("Video Player ......... Double-click video in playlist").color(dim).monospace());
+                ui.add_space(8.0);
+
                 if retro_btn(ui, "CLOSE", Color32::from_rgb(0, 255, 0), th.btn_bg).clicked() {
                     self.show_help = false;
                 }
@@ -4591,26 +4942,11 @@ EQ      : Equalizer presets";
         }
     }
 
-    fn play_video_item(&mut self, path: String) {
-        self.video_closing = false;
-        if let Some(mut c) = self.video_audio_proc.take() {
-            let _ = c.kill();
-        }
-        if let Some(s) = self.video_sink.take() {
-            s.stop();
-        }
-        self.video_gen += 1;
-        let gen = self.video_gen;
-        let _ = self.lib_tx.send(LibCmd::VideoOpen(path.clone(), gen));
-        self.video_on = true;
-        self.video_paused = false;
-        self.video_pos = egui::pos2(60.0, 60.0);
-        self.video_tex = None;
-        self.video_bar_visible = false;
-        match spawn_video_audio(&path, &ffmpeg_path()) {
+    fn attach_video_audio(&mut self, path: &str, seek: f32) {
+        match spawn_video_audio(path, &ffmpeg_path(), seek) {
             Ok((mut child, pipe)) => {
                 if let Ok(mut sink) = Sink::try_new(&self._stream_handle) {
-                    sink.set_volume(self.state.volume as f32 / 100.0 * 0.9);
+                    sink.set_volume(self.video_volume as f32 / 100.0 * 0.9);
                     sink.append(pipe);
                     sink.play();
                     self.video_audio_proc = Some(child);
@@ -4621,6 +4957,64 @@ EQ      : Equalizer presets";
             }
             Err(e) => self.set_status(format!("MOVIE (video only): {}", e)),
         }
+    }
+
+    fn seek_video(&mut self, tsecs: f32) {
+        let Some(path) = self.video_current.clone() else { return };
+        let mut tsecs = tsecs.max(0.0);
+        if self.video_dur_secs > 0.0 {
+            tsecs = tsecs.min((self.video_dur_secs - 1.0).max(0.0));
+        }
+        if let Some(mut c) = self.video_audio_proc.take() {
+            let _ = c.kill();
+        }
+        if let Some(s) = self.video_sink.take() {
+            s.stop();
+        }
+        self.video_gen += 1;
+        let gen = self.video_gen;
+        let _ = self.lib_tx.send(LibCmd::VideoOpen { path: path.clone(), gen, seek: tsecs });
+        self.video_closing = false;
+        self.video_paused = false;
+        self.video_ended = false;
+        self.video_cur_secs = tsecs;
+        self.attach_video_audio(&path, tsecs);
+        let frac = if self.video_dur_secs > 0.0 { (tsecs / self.video_dur_secs).clamp(0.0, 1.0) } else { 0.0 };
+        self.set_status(format!("MOVIE seek {:.0}%", frac * 100.0));
+    }
+
+    fn play_video_item(&mut self, path: String) {
+        self.video_closing = false;
+        if let Some(mut c) = self.video_audio_proc.take() {
+            let _ = c.kill();
+        }
+        if let Some(s) = self.video_sink.take() {
+            s.stop();
+        }
+        if self.deck_mode == DeckMode::Tape {
+            if let Some(cur) = self.state.current_song.clone() {
+                if Path::new(&cur).is_file() {
+                    self.deck_resume = Some((cur, self.pos.max(0.0)));
+                }
+            }
+        }
+        self.stop_radio();
+        self.stop_music();
+        self.video_gen += 1;
+        let gen = self.video_gen;
+        let _ = self.lib_tx.send(LibCmd::VideoOpen { path: path.clone(), gen, seek: 0.0 });
+        self.video_aspect = self.video_aspects.get(&path).copied().unwrap_or(self.video_aspect_default);
+        self.video_on = true;
+        self.video_paused = false;
+        self.video_ended = false;
+        self.video_pos = egui::pos2(60.0, 60.0);
+        self.video_tex = None;
+        self.video_bar_visible = false;
+        self.video_dur_secs = 0.0;
+        self.video_cur_secs = 0.0;
+        self.video_seek_t = None;
+        self.video_current = Some(path.clone());
+        self.attach_video_audio(&path, 0.0);
         self.set_status(format!("MOVIE {}/{}: {}", self.video_queue_idx + 1, self.video_queue.len(), stem(&path)));
     }
 
@@ -4697,8 +5091,9 @@ EQ      : Equalizer presets";
         self.video_closing = true;
         let _ = self.lib_tx.send(LibCmd::VideoClose);
         self.video_on = false;
+        self.video_ended = false;
         self.video_tex = None;
-        self.video_fs = false;
+        self.set_video_fs(false);
         if let Some(mut c) = self.video_audio_proc.take() {
             let _ = c.kill();
         }
@@ -4707,13 +5102,36 @@ EQ      : Equalizer presets";
         }
     }
 
+    fn toggle_video_play(&mut self) {
+        if self.video_ended {
+            self.video_ended = false;
+            self.video_paused = false;
+            if self.video_queue_idx < self.video_queue.len() {
+                self.play_video_item(self.video_queue[self.video_queue_idx].clone());
+                self.set_status("MOVIE: replay");
+            }
+            return;
+        }
+        self.video_paused = !self.video_paused;
+        let _ = self.lib_tx.send(LibCmd::VideoPause(self.video_paused));
+        if let Some(s) = &self.video_sink {
+            if self.video_paused { s.pause(); } else { s.play(); }
+        }
+        self.set_status(if self.video_paused { "MOVIE: paused" } else { "MOVIE: playing" });
+    }
+
     fn video_window(&mut self, ctx: &egui::Context) {
         let (w, h) = self.video_dims;
         if self.video_fs {
             let scr = ctx.viewport_rect();
             let sw = scr.width();
             let sh = scr.height();
-            let (iw, ih) = if w > 0 && h > 0 { (w as f32, h as f32) } else { (16.0, 9.0) };
+            let (iw0, ih0) = if w > 0 && h > 0 { (w as f32, h as f32) } else { (16.0, 9.0) };
+            let (iw, ih) = match self.video_aspect {
+                VideoAspect::Original => (iw0, ih0),
+                VideoAspect::R43 => (4.0, 3.0),
+                VideoAspect::R169 => (16.0, 9.0),
+            };
             let scale = (sw / iw).min(sh / ih);
             let vw = iw * scale;
             let vh = ih * scale;
@@ -4726,6 +5144,7 @@ EQ      : Equalizer presets";
             let mut next = false;
             let mut prev = false;
             let mut add = false;
+            let mut aspect_cycle = false;
             let mut play_idx: Option<usize> = None;
             let mut del_idx: Option<usize> = None;
             let mut clearq = false;
@@ -4762,6 +5181,21 @@ EQ      : Equalizer presets";
                         }
                         if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(352.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new("+ ADD")).clicked() {
                             add = true;
+                        }
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(448.0, 4.0), egui::vec2(150.0, 22.0)), egui::Button::new(format!("ASPECT {}", self.video_aspect.label()))).clicked() {
+                            aspect_cycle = true;
+                        }
+                        let mut vv = self.video_volume;
+                        let vsl = ui.put(
+                            egui::Rect::from_min_size(scr.min + egui::vec2(706.0, 8.0), egui::vec2(170.0, 14.0)),
+                            egui::Slider::new(&mut vv, 0..=200).text("VOL"),
+                        );
+                        if vsl.changed() {
+                            self.video_volume = vv;
+                            if let Some(s) = &self.video_sink {
+                                s.set_volume(vv as f32 / 100.0 * 0.9);
+                            }
+                            self.save_settings();
                         }
                         let qu_lbl = if self.video_queue_pin { "HIDE QUEUE" } else { "SHOW QUEUE" };
                         if ui.put(egui::Rect::from_min_size(scr.max - egui::vec2(140.0, 26.0), egui::vec2(128.0, 22.0)), egui::Button::new(qu_lbl)).clicked() {
@@ -4807,6 +5241,40 @@ EQ      : Equalizer presets";
                             });
                         });
                     }
+                    let bottom_hover = mouse.map_or(false, |m| m.y >= sh - 64.0 && m.y <= sh && m.x >= scr.min.x && m.x <= scr.max.x);
+                    let show_seek = bottom_hover || self.video_seek_t.is_some();
+                    if show_seek {
+                        let by = sh - 66.0;
+                        let lx = 40.0;
+                        let rx = sw - 40.0;
+                        let track = egui::Rect::from_min_max(egui::pos2(lx, by + 24.0), egui::pos2(rx, by + 30.0));
+                        let yt = if let Some(t) = self.video_seek_t { t } else if self.video_dur_secs > 0.0 { (self.video_cur_secs / self.video_dur_secs).clamp(0.0, 1.0) } else { 0.0 };
+                        let p = ui.painter();
+                        p.rect_filled(egui::Rect::from_min_max(scr.min + egui::vec2(0.0, by), egui::pos2(scr.max.x, scr.max.y)), 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+                        p.rect_filled(track, 3.0, Color32::from_gray(60));
+                        let fw = track.width() * yt;
+                        if fw > 0.0 {
+                            p.rect_filled(egui::Rect::from_min_size(track.min, egui::vec2(fw, track.height())), 3.0, Color32::from_rgb(255, 200, 60));
+                        }
+                        let tcol = Color32::from_rgb(225, 225, 225);
+                        let shown_cur = if let Some(t) = self.video_seek_t { t * self.video_dur_secs } else { self.video_cur_secs };
+                        p.text(egui::pos2(lx, by + 10.0), egui::Align2::LEFT_CENTER, fmt_time(shown_cur), egui::FontId::monospace(13.0), tcol);
+                        p.text(egui::pos2(rx, by + 10.0), egui::Align2::RIGHT_CENTER, fmt_time(self.video_dur_secs), egui::FontId::monospace(13.0), tcol);
+                        if self.video_dur_secs > 0.0 {
+                            let mut t = yt;
+                            let slip = ui.put(
+                                egui::Rect::from_min_max(egui::pos2(lx, by), egui::pos2(rx, by + 34.0)),
+                                egui::Slider::new(&mut t, 0.0..=1.0).show_value(false),
+                            );
+                            if slip.drag_started() || slip.dragged() {
+                                self.video_seek_t = Some(t.clamp(0.0, 1.0));
+                            }
+                            if slip.drag_stopped() {
+                                self.video_seek_t = None;
+                                self.seek_video(t.clamp(0.0, 1.0) * self.video_dur_secs);
+                            }
+                        }
+                    }
                     if resp.double_clicked() {
                         togg = true;
                     }
@@ -4823,15 +5291,19 @@ EQ      : Equalizer presets";
                     self.enqueue_videos(vids);
                 }
             }
+            if aspect_cycle {
+                self.video_aspect = self.video_aspect.next();
+                self.video_aspect_default = self.video_aspect;
+                if let Some(p) = self.video_current.clone() {
+                    self.video_aspects.insert(p, self.video_aspect);
+                }
+                self.save_settings();
+                self.set_status(format!("MOVIE aspect {}: {}", self.video_aspect.label(), stem(self.video_current.as_deref().unwrap_or("-"))));
+            }
             if prev { self.queue_prev(); }
             if next { self.queue_next(); }
             if togg {
-                self.video_paused = !self.video_paused;
-                let _ = self.lib_tx.send(LibCmd::VideoPause(self.video_paused));
-                if let Some(s) = &self.video_sink {
-                    if self.video_paused { s.pause(); } else { s.play(); }
-                }
-                self.set_status(if self.video_paused { "MOVIE: paused" } else { "MOVIE: playing" });
+                self.toggle_video_play();
             }
             if close {
                 self.close_video();
@@ -4876,19 +5348,23 @@ EQ      : Equalizer presets";
                             togg = true;
                         }
                         ui.horizontal(|ui| {
+                            ui.label(RichText::new("VOL").color(self.theme_colors().accent).monospace().size(10.0));
+                            let mut vv = self.video_volume;
+                            if ui.add(egui::Slider::new(&mut vv, 0..=200).show_value(false)).changed() {
+                                self.video_volume = vv;
+                                if let Some(s) = &self.video_sink {
+                                    s.set_volume(vv as f32 / 100.0 * 0.9);
+                                }
+                                self.save_settings();
+                            }
                             if ui.button("Close").clicked() { close = true; }
                             if ui.button(if self.video_paused { "Play" } else { "Pause" }).clicked() { togg = true; }
-                            if ui.button("Fullscreen [Alt+Enter]").clicked() { self.video_fs = true; }
+                            if ui.button("Fullscreen [Alt+Enter]").clicked() { self.set_video_fs(true); }
                         });
                     });
             });
         if togg {
-            self.video_paused = !self.video_paused;
-            let _ = self.lib_tx.send(LibCmd::VideoPause(self.video_paused));
-            if let Some(s) = &self.video_sink {
-                if self.video_paused { s.pause(); } else { s.play(); }
-            }
-            self.set_status(if self.video_paused { "MOVIE: paused" } else { "MOVIE: playing" });
+            self.toggle_video_play();
         }
         if close {
             self.close_video();
@@ -5118,16 +5594,6 @@ fn song_sort_key(path: &str) -> (String, String) {
             .unwrap_or_default();
         (folder.to_lowercase(), s.to_lowercase())
     }
-}
-
-fn visualizer_bars(t: f32) -> Vec<f32> {
-    (0..12)
-        .map(|i| {
-            let a = (t * 7.0 + (i as f32 * 13.7)).sin().abs() * 16.0;
-            let b = (t * 3.3 + (i as f32 * 7.1)).fract().abs() * 18.0;
-            5.0 + a + b
-        })
-        .collect()
 }
 
 fn band_of(path: &str) -> String {
