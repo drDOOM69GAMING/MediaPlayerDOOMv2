@@ -2109,7 +2109,6 @@ struct PlayerApp {
     video_aspect_default: VideoAspect,
     video_volume: u32,
     deck_resume: Option<(String, f32)>,
-    video_queue_pin: bool,
     video_positions: HashMap<String, f32>,
     intro_skip_enabled: bool,
     intro_skip_secs: f32,
@@ -2295,9 +2294,8 @@ video_ended: false,
         video_aspect_default,
         video_volume,
         deck_resume: None,
-            video_queue_pin: false,
-            video_positions: HashMap::new(),
-            intro_skip_enabled: false,
+        video_positions: HashMap::new(),
+        intro_skip_enabled: false,
             intro_skip_secs: 90.0,
             credits_skip_secs: 90.0,
             video_bounds: HashMap::new(),
@@ -5451,7 +5449,7 @@ video_ended: false,
             let hovering = mouse.map_or(false, |m| {
                 (m.y <= scr.min.y + 34.0 && m.x >= scr.min.x && m.x <= scr.max.x) || queue_region.contains(m)
             });
-            self.video_bar_visible = hovering || self.video_queue_pin;
+            self.video_bar_visible = hovering;
             let mut close = false;
             let mut togg = false;
             let mut next = false;
@@ -5556,10 +5554,6 @@ video_ended: false,
                                 s.set_volume(vv as f32 / 100.0 * 0.9);
                             }
                             self.save_settings();
-                        }
-                        let qu_lbl = if self.video_queue_pin { "HIDE QUEUE" } else { "SHOW QUEUE" };
-                        if ui.put(egui::Rect::from_min_size(scr.max - egui::vec2(140.0, 26.0), egui::vec2(128.0, 22.0)), egui::Button::new(qu_lbl)).clicked() {
-                            self.video_queue_pin = !self.video_queue_pin;
                         }
                     }
                     if self.video_bar_visible && !self.video_queue.is_empty() {
