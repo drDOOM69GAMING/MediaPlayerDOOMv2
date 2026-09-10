@@ -44,6 +44,14 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 `P` play/pause · `S`/`N` skip · `Left` previous · `R` record · `+`/`-` volume · `F` fullscreen · `M` mute · `D` mode · `V` video · `L` lyrics
 
+
+
+
+<img width="3834" height="2155" alt="Screenshot 2026-09-10 133844" src="https://github.com/user-attachments/assets/49e8a167-8b41-4166-9239-08067e05e3c4" />
+<img width="3824" height="2155" alt="Screenshot 2026-09-10 133812" src="https://github.com/user-attachments/assets/6a162706-f897-40e7-b048-7eb8326796f1" />
+<img width="3834" height="2155" alt="Screenshot 2026-09-10 133734" src="https://github.com/user-attachments/assets/052d9c5d-37c1-475f-bdf8-a1cabd113df7" />
+
+
 ## Notes
 
 - The equalizer is currently **locked to FLAT** and shows a hover hint explaining why. It caused playback problems (videos stuck loading, bogus metadata) when enabled, so it has been disabled until the background EQ encode is reworked in a future build. Band changes / preset cycling / the ON-OFF toggle are disabled.
