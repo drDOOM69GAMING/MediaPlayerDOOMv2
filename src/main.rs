@@ -1069,6 +1069,55 @@ fn probe_video_duration(path: &str) -> f32 {
     }
 }
 
+fn probe_video_info(path: &str) -> (u32, u32, f32) {
+    let fp = tools_dir().join("ffprobe.exe");
+    if !fp.is_file() {
+        return (0, 0, 0.0);
+    }
+    let out = std::process::Command::new(fp)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,avg_frame_rate", "-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .creation_flags(NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) => {
+            let lines: Vec<&str> = std::str::from_utf8(&o.stdout).unwrap_or("")
+                .lines().map(|s| s.trim()).collect();
+            let w = lines.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let h = lines.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            let fps = lines.get(2).and_then(|s| {
+                if let Some((n, d)) = s.split_once('/') {
+                    let n: f32 = n.trim().parse().ok()?;
+                    let d: f32 = d.trim().parse().ok()?;
+                    if d > 0.0 { Some(n / d) } else { None }
+                } else {
+                    s.parse::<f32>().ok().filter(|f| *f > 0.0)
+                }
+            }).unwrap_or(0.0);
+            if w == 0 || h == 0 { (0, 0, fps) } else { (w, h, fps) }
+        }
+        Err(_) => (0, 0, 0.0),
+    }
+}
+
+fn fit_video_dims(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w == 0 || h == 0 || max_w == 0 || max_h == 0 {
+        return (640, 360);
+    }
+    let mut tw = w;
+    let mut th = h;
+    let ws = max_w as f32 / tw as f32;
+    let hs = max_h as f32 / th as f32;
+    let s = ws.min(hs);
+    if s < 1.0 {
+        tw = ((tw as f32) * s) as u32;
+        th = ((th as f32) * s) as u32;
+    }
+    if tw % 2 != 0 { tw = tw.saturating_sub(1); }
+    if th % 2 != 0 { th = th.saturating_sub(1); }
+    (tw.max(2), th.max(2))
+}
+
 fn video_audio_levels(path: &str, ffmpeg: &Path, start: f32, len: f32) -> Vec<f32> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
@@ -1329,13 +1378,16 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
             LibCmd::VideoOpen { path, gen, seek } => {
                 if let Some(mut c) = video_child.take() { let _ = c.kill(); }
                 if let Some(t) = video_thread.take() { let _ = t.join(); }
+                let (sw, sh, sfps) = probe_video_info(&path);
+                let (tw, th) = fit_video_dims(sw, sh, 1920, 1080);
+                let fps = if sfps > 0.0 { sfps } else { 24.0 };
                 let mut cmd = std::process::Command::new(ffmpeg_path());
                 cmd.args(["-hide_banner", "-loglevel", "error"]);
                 if seek > 0.0 {
                     cmd.args(["-ss"]).arg(format!("{:.3}", seek));
                 }
                 cmd.arg("-i").arg(&path)
-                    .args(["-an", "-vf", "scale=640:360", "-r", "24", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                    .args(["-an", "-vf", &format!("scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2", tw, th, tw, th), "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
                     .creation_flags(NO_WINDOW);
@@ -1349,16 +1401,17 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                 let dur = probe_video_duration(&path);
                 let _ = tx.send(Msg::VideoMeta { gen, dur });
                 if let Some(stdout) = child.stdout.take() {
-                    let w = 640u32;
-                    let h = 360u32;
+                    let w = tw;
+                    let h = th;
                     let pausef = std::sync::Arc::clone(video_pause);
                     let tx2 = tx.clone();
+                    let pos_send = (fps as u64).max(1);
                     *video_thread = Some(std::thread::spawn(move || {
                         use std::io::Read;
                         let frame = (w * h * 3) as usize;
                         let mut buf = vec![0u8; frame];
                         let mut pipe = stdout;
-                        let fps = 24.0f32;
+                        let fps = fps;
                         let frame_t = std::time::Duration::from_secs_f64(1.0 / fps as f64);
                         let mut next_t = std::time::Instant::now();
                         let mut was_paused = false;
@@ -1390,7 +1443,7 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                                 break;
                             }
                             frames += 1;
-                            if frames % 24 == 0 {
+                            if frames % pos_send == 0 {
                                 let secs = seek + frames as f32 / fps;
                                 if tx2.send(Msg::VideoPos { gen, secs }).is_err() {
                                     break;
@@ -2094,6 +2147,8 @@ struct PlayerApp {
     video_fs: bool,
     video_sink: Option<Sink>,
     video_audio_proc: Option<Child>,
+    video_audio_pending: bool,
+    video_last_mouse: f64,
     video_bar_visible: bool,
     video_queue: Vec<String>,
     video_queue_idx: usize,
@@ -2279,6 +2334,8 @@ impl PlayerApp {
             video_fs: false,
             video_sink: None,
             video_audio_proc: None,
+            video_audio_pending: false,
+            video_last_mouse: 0.0,
             video_bar_visible: false,
             video_queue: Vec::new(),
             video_queue_idx: 0,
@@ -2641,6 +2698,12 @@ video_ended: false,
                     let size = [w as usize, h as usize];
                     let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                     self.video_tex = Some(self.ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
+                    if self.video_audio_pending && !self.video_paused {
+                        self.video_audio_pending = false;
+                        if let Some(s) = &self.video_sink {
+                            s.play();
+                        }
+                    }
                 }
                 Msg::VideoClosed { gen } => {
                     let was_eof = gen == self.video_gen && !self.video_closing;
@@ -3950,6 +4013,8 @@ video_ended: false,
         self.video_fs = on;
         if !on {
             self.video_pos = egui::pos2(60.0, 60.0);
+        } else {
+            self.video_last_mouse = 0.0;
         }
     }
 
@@ -5191,17 +5256,26 @@ video_ended: false,
     fn attach_video_audio(&mut self, path: &str, seek: f32) {
         match spawn_video_audio(path, &ffmpeg_path(), seek) {
             Ok((mut child, pipe)) => {
-                if let Ok(mut sink) = Sink::try_new(&self._stream_handle) {
+                if let Ok(sink) = Sink::try_new(&self._stream_handle) {
                     sink.set_volume(self.video_volume as f32 / 100.0 * 0.9);
                     sink.append(pipe);
-                    sink.play();
+                    if !self.video_paused {
+                        if self.video_tex.is_some() {
+                            sink.play();
+                        } else {
+                            self.video_audio_pending = true;
+                        }
+                    }
                     self.video_audio_proc = Some(child);
                     self.video_sink = Some(sink);
                 } else {
                     let _ = child.kill();
                 }
             }
-            Err(e) => self.set_status(format!("MOVIE (video only): {}", e)),
+            Err(e) => {
+                self.video_audio_pending = false;
+                self.set_status(format!("MOVIE (video only): {}", e));
+            }
         }
     }
 
@@ -5224,6 +5298,7 @@ video_ended: false,
         self.video_paused = false;
         self.video_ended = false;
         self.video_cur_secs = tsecs;
+        self.video_tex = None;
         self.attach_video_audio(&path, tsecs);
         let frac = if self.video_dur_secs > 0.0 { (tsecs / self.video_dur_secs).clamp(0.0, 1.0) } else { 0.0 };
         self.set_status(format!("MOVIE seek {:.0}%", frac * 100.0));
@@ -5442,6 +5517,14 @@ video_ended: false,
             let vh = ih * scale;
             let img = egui::Rect::from_center_size(scr.center(), egui::vec2(vw, vh));
             let mouse = ctx.input(|i| i.pointer.latest_pos());
+            let t_now = ctx.input(|i| i.time);
+            let mouse_moved = ctx.input(|i| i.pointer.delta().length() > 0.0 || i.pointer.any_pressed());
+            if self.video_last_mouse == 0.0 {
+                self.video_last_mouse = t_now;
+            }
+            if mouse_moved {
+                self.video_last_mouse = t_now;
+            }
             let queue_region = egui::Rect::from_min_max(
                 egui::pos2(scr.max.x - 300.0, scr.min.y + 32.0),
                 egui::pos2(scr.max.x, scr.max.y),
@@ -5677,6 +5760,7 @@ video_ended: false,
             if close {
                 self.close_video();
             }
+            self.video_hide_cursor(ctx, t_now);
             return;
         }
         let vw = 480.0f32;
@@ -5737,6 +5821,18 @@ video_ended: false,
         }
         if close {
             self.close_video();
+        }
+    }
+
+    fn video_hide_cursor(&mut self, ctx: &egui::Context, t_now: f64) {
+        if !self.video_fs || self.video_paused || self.video_ended || self.video_bar_visible {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
+            return;
+        }
+        if t_now - self.video_last_mouse > 5.0 {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        } else {
+            ctx.set_cursor_icon(egui::CursorIcon::Default);
         }
     }
 }

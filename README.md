@@ -44,7 +44,6 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 `P` play/pause · `S`/`N` skip · `Left` previous · `R` record · `+`/`-` volume · `F` fullscreen · `M` mute · `D` mode · `V` video · `L` lyrics
 
-
 ## App Images
 
 <img width="3834" height="2155" alt="Screenshot 2026-09-10 133844" src="https://github.com/user-attachments/assets/49e8a167-8b41-4166-9239-08067e05e3c4" />
@@ -56,10 +55,12 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 - The equalizer is currently **locked to FLAT** and shows a hover hint explaining why. It caused playback problems (videos stuck loading, bogus metadata) when enabled, so it has been disabled until the background EQ encode is reworked in a future build. Band changes / preset cycling / the ON-OFF toggle are disabled.
 - If you build from source and have `tools/ffmpeg.exe`, `tools/ffprobe.exe`, `tools/yt-dlp.exe` next to `Cargo.toml`, they are embedded into the exe by `build.rs` (that folder is gitignored). Without them the app falls back to downloading on first run.
-- The easter egg only shows when the right panel is pulled out.
 
 ## v2.4.0 changelog
 
+- **Original aspect ratio (ORIG)**: the video decode now preserves each file's true aspect ratio instead of stretching everything to 16:9, so 4:3 shows and the ORIG aspect button matches the source.
+- **Audio/video sync**: video frames are paced at the file's real framerate (not a fixed 24fps), and playback audio waits until the first frame is on screen — voices and picture stay in sync.
+- **Cursor auto-hide**: in fullscreen the mouse cursor hides after 5 seconds of no movement and reappears as soon as you move it again.
 - **Automatic intro/credits detection**: videos with **SKIP: ON** are analyzed on play — the app measures the audio front/back, finds where the intro ends and credits/outro begins, then auto-skips the intro and hops to the next video when credits roll.
 - **Manual INTRO / CREDS markers** in the video top bar: click during playback to mark intro-end or credits-start at the current position for that file/folder; persisted in settings.
 - **Queue stays open while you use it**: the bar and queue show whenever the mouse is over the top strip or the queue panel, and hide the moment it leaves — so you can scroll, play rows, and hit CLEAR without them vanishing mid-use. The old SHOW QUEUE pin toggle is removed.
