@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+include!(concat!(env!("OUT_DIR"), "/embedded_tools.rs"));
+
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -642,6 +644,9 @@ fn default_radio() -> Vec<RadioStation> {
         RadioStation { name: "SomaFM Indie Pop Rocks".into(), band: "FM".into(), freq: 94.5, url: "https://ice1.somafm.com/indiepop-128-mp3".into() },
         RadioStation { name: "SomaFM Sonic Universe".into(), band: "FM".into(), freq: 96.3, url: "https://ice1.somafm.com/sonicuniverse-128-mp3".into() },
         RadioStation { name: "SomaFM Underground 80s".into(), band: "FM".into(), freq: 101.1, url: "https://ice1.somafm.com/u80s-128-mp3".into() },
+        RadioStation { name: "Kissin 92.5 (Joplin)".into(), band: "FM".into(), freq: 92.5, url: "https://playerservices.streamtheworld.com/api/livestream-redirect/KSYNFM.mp3".into() },
+        RadioStation { name: "Big Dog 97.9 (Joplin)".into(), band: "FM".into(), freq: 97.9, url: "https://playerservices.streamtheworld.com/api/livestream-redirect/KXDGFM.mp3".into() },
+        RadioStation { name: "Rock 107.1 (Joplin)".into(), band: "FM".into(), freq: 107.1, url: "https://ice42.securenetsystems.net/KJML".into() },
     ]
 }
 
@@ -747,8 +752,25 @@ fn filter_signal(x: &[f64], coeffs: &Biquad) -> Vec<f64> {
     x.iter().map(|&v| f.process(v)).collect()
 }
 
-fn eq_tmp_path() -> PathBuf {
-    std::env::temp_dir().join("mediaplayerofdoom_eq.wav")
+fn eq_out_path(rid: u64) -> PathBuf {
+    std::env::temp_dir().join(format!("mpoofdoom_eq_{}.wav", rid))
+}
+
+fn gc_eq_files(current: u64) {
+    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = name.strip_prefix("mpoofdoom_eq_") {
+                if let Some(rest) = rest.strip_suffix(".wav") {
+                    if let Ok(n) = rest.parse::<u64>() {
+                        if n + 2 < current {
+                            let _ = std::fs::remove_file(e.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 enum Msg {
@@ -773,7 +795,7 @@ enum Msg {
     Recorded { display: String, path: String },
     RecordFail { display: String, err: String },
     VideoFrame { w: u32, h: u32, rgba: Vec<u8> },
-    VideoClosed,
+    VideoClosed { gen: u64 },
 }
 
 enum LibCmd {
@@ -788,7 +810,7 @@ enum LibCmd {
     Record { display: String, audio: String, dest: String },
     RecordRadio { display: String, url: String, dest: String },
     FindMusicFolder,
-    VideoOpen(String),
+    VideoOpen(String, u64),
     VideoClose,
     VideoPause(bool),
 }
@@ -940,11 +962,41 @@ fn spawn_radio_stream(url: &str, ffmpeg: &Path) -> Result<(Child, PipeSource), S
     ))
 }
 
+fn spawn_video_audio(path: &str, ffmpeg: &Path) -> Result<(Child, PipeSource), String> {
+    let mut child = Command::new(ffmpeg.to_string_lossy().to_string())
+        .args(["-re", "-i", path, "-vn", "-ac", "2", "-ar", "44100", "-f", "s16le", "-"])
+        .stdout(std::process::Stdio::piped())
+        .creation_flags(NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("ffmpeg video audio failed to start: {}", e))?;
+    let stdout = child.stdout.take().ok_or("ffmpeg gave no audio output")?;
+    Ok((
+        child,
+        PipeSource { reader: BufReader::new(stdout), pending: VecDeque::new() },
+    ))
+}
+
 fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
+    let video_pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut video_child: Option<Child> = None;
     let mut video_thread: Option<std::thread::JoinHandle<()>> = None;
-    let video_pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Err(e) = ensure_tools(&tx) {
+        let _ = tx.send(Msg::YtStatus(format!("Tools unavailable: {}", e)));
+    }
     while let Ok(cmd) = rx.recv() {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_lib(cmd, &tx, &video_pause, &mut video_child, &mut video_thread);
+        }));
+        if let Err(p) = res {
+            let msg = if let Some(s) = p.downcast_ref::<&str>() { (*s).to_string() }
+                else if let Some(s) = p.downcast_ref::<String>() { s.clone() }
+                else { "unknown panic".to_string() };
+            let _ = tx.send(Msg::Error(format!("Background task crashed: {}", msg)));
+        }
+    }
+}
+
+fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::sync::atomic::AtomicBool>, video_child: &mut Option<Child>, video_thread: &mut Option<std::thread::JoinHandle<()>>) {
         match cmd {
             LibCmd::Scan(dir) => {
                 let files = collect_audio(&dir);
@@ -1008,7 +1060,8 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
             }
             LibCmd::EqEncode(rid, path, bands) => {
                 let bands_arr: [f32; 10] = bands.as_slice().try_into().unwrap_or([0.0; 10]);
-                match encode_eq(&path, &bands_arr) {
+                let out = eq_out_path(rid);
+                match encode_eq(&path, &bands_arr, &out) {
                     Ok(()) => { let _ = tx.send(Msg::EqReady(rid)); }
                     Err(e) => {
                         let _ = tx.send(Msg::Error(format!("EQ failed: {}", e)));
@@ -1038,13 +1091,13 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
                 let folder = find_music_folder();
                 let _ = tx.send(Msg::FolderFound { folder });
             }
-            LibCmd::VideoOpen(path) => {
+            LibCmd::VideoOpen(path, gen) => {
                 if let Some(mut c) = video_child.take() { let _ = c.kill(); }
                 if let Some(t) = video_thread.take() { let _ = t.join(); }
                 let mut child = match std::process::Command::new(ffmpeg_path())
                     .args(["-hide_banner", "-loglevel", "error", "-i"])
                     .arg(&path)
-                    .args(["-an", "-vf", "scale=640:360", "-r", "15", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+                    .args(["-an", "-vf", "scale=640:360", "-r", "24", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
                     .spawn()
@@ -1052,22 +1105,37 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(Msg::Error(format!("ffmpeg could not start video: {}", e)));
-                        continue;
+                        return;
                     }
                 };
                 if let Some(stdout) = child.stdout.take() {
                     let w = 640u32;
                     let h = 360u32;
-                    let pausef = video_pause.clone();
+                    let pausef = std::sync::Arc::clone(video_pause);
                     let tx2 = tx.clone();
-                    video_thread = Some(std::thread::spawn(move || {
+                    *video_thread = Some(std::thread::spawn(move || {
                         use std::io::Read;
                         let frame = (w * h * 3) as usize;
                         let mut buf = vec![0u8; frame];
                         let mut pipe = stdout;
+                        let fps = 24.0f32;
+                        let frame_t = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+                        let mut next_t = std::time::Instant::now();
+                        let mut was_paused = false;
                         loop {
-                            if pausef.load(std::sync::atomic::Ordering::Relaxed) {
+                            let paused = pausef.load(std::sync::atomic::Ordering::Relaxed);
+                            if paused {
+                                was_paused = true;
                                 std::thread::sleep(std::time::Duration::from_millis(30));
+                                continue;
+                            }
+                            if was_paused {
+                                next_t = std::time::Instant::now();
+                                was_paused = false;
+                            }
+                            let now = std::time::Instant::now();
+                            if now < next_t {
+                                std::thread::sleep(next_t - now);
                                 continue;
                             }
                             if pipe.read_exact(&mut buf).is_err() {
@@ -1080,22 +1148,22 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
                             if tx2.send(Msg::VideoFrame { w, h, rgba }).is_err() {
                                 break;
                             }
+                            next_t += frame_t;
                         }
-                        let _ = tx2.send(Msg::VideoClosed);
+                        let _ = tx2.send(Msg::VideoClosed { gen });
                     }));
                 }
-                video_child = Some(child);
+                *video_child = Some(child);
             }
             LibCmd::VideoClose => {
                 if let Some(mut c) = video_child.take() { let _ = c.kill(); }
                 if let Some(t) = video_thread.take() { let _ = t.join(); }
-                let _ = tx.send(Msg::VideoClosed);
+                let _ = tx.send(Msg::VideoClosed { gen: 0 });
             }
             LibCmd::VideoPause(p) => {
                 video_pause.store(p, std::sync::atomic::Ordering::Relaxed);
             }
         }
-    }
 }
 
 fn find_music_folder() -> Option<String> {
@@ -1186,7 +1254,14 @@ fn load_tagged(path: &str) -> Option<lofty::file::TaggedFile> {
     probe.read().ok()
 }
 
-fn encode_eq(path: &str, bands: &[f32; 10]) -> Result<(), String> {
+fn encode_eq(path: &str, bands: &[f32; 10], out: &Path) -> Result<(), String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode_eq_impl(path, bands, out))) {
+        Ok(r) => r,
+        Err(_) => Err("EQ render panicked: file not decodable".into()),
+    }
+}
+
+fn encode_eq_impl(path: &str, bands: &[f32; 10], out: &Path) -> Result<(), String> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::formats::FormatOptions;
@@ -1286,15 +1361,14 @@ fn encode_eq(path: &str, bands: &[f32; 10]) -> Result<(), String> {
         }
     }
 
-    let out = eq_tmp_path();
-    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(out);
     let wspec = hound::WavSpec {
         channels: if channels > 1 { 2 } else { 1 } as u16,
         sample_rate: rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let f = File::create(&out).map_err(|e| e.to_string())?;
+    let f = File::create(out).map_err(|e| e.to_string())?;
     let mut wr = hound::WavWriter::new(f, wspec).map_err(|e| e.to_string())?;
     let to_i16 = |v: f64| (v.clamp(-1.0, 1.0) * 32767.0) as i16;
     if channels > 1 {
@@ -1313,23 +1387,25 @@ fn encode_eq(path: &str, bands: &[f32; 10]) -> Result<(), String> {
 
 fn net_loop(rx: Receiver<NetCmd>, tx: Sender<Msg>) {
     while let Ok(cmd) = rx.recv() {
-        match cmd {
-            NetCmd::WebArt(artist, album) => {
-                let bytes = fetch_web_art(&artist, &album);
-                let _ = tx.send(Msg::ArtWeb { bytes });
-            }
-            NetCmd::Lyrics(artist, title) => {
-                let text = fetch_lyrics(&artist, &title);
-                let _ = tx.send(Msg::Lyrics { text });
-            }
-            NetCmd::YtDownload(query) => {
-                let r = yt_download_and_store(&query, &tx);
-                match r {
-                    Ok(path) => { let _ = tx.send(Msg::YtDone { path }); }
-                    Err(e) => { let _ = tx.send(Msg::YtFail(e)); }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match cmd {
+                NetCmd::WebArt(artist, album) => {
+                    let bytes = fetch_web_art(&artist, &album);
+                    let _ = tx.send(Msg::ArtWeb { bytes });
+                }
+                NetCmd::Lyrics(artist, title) => {
+                    let text = fetch_lyrics(&artist, &title);
+                    let _ = tx.send(Msg::Lyrics { text });
+                }
+                NetCmd::YtDownload(query) => {
+                    let r = yt_download_and_store(&query, &tx);
+                    match r {
+                        Ok(path) => { let _ = tx.send(Msg::YtDone { path }); }
+                        Err(e) => { let _ = tx.send(Msg::YtFail(e)); }
+                    }
                 }
             }
-        }
+        }));
     }
 }
 
@@ -1384,7 +1460,10 @@ fn exe_dir() -> PathBuf {
 }
 
 fn tools_dir() -> PathBuf {
-    let d = exe_dir().join("tools");
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| exe_dir());
+    let d = base.join("MediaPlayerOFDOOM").join("tools");
     let _ = std::fs::create_dir_all(&d);
     d
 }
@@ -1417,37 +1496,78 @@ fn download_tool(url: &str, dst: &Path, label: &str, tx: &Sender<Msg>) -> Result
     Ok(())
 }
 
+fn write_bin(dst: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    std::fs::write(dst, bytes).map_err(|e| format!("could not extract {}: {}", label, e))
+}
+
 fn ensure_tools(tx: &Sender<Msg>) -> Result<(), String> {
+    let _ = std::fs::create_dir_all(tools_dir());
     let ytdlp = ytdlp_path();
     if !ytdlp.is_file() {
-        download_tool(
-            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
-            &ytdlp,
-            "yt-dlp",
-            tx,
-        )?;
+        match EMBEDDED_YTDLP {
+            Some(b) => write_bin(&ytdlp, b, "yt-dlp")?,
+            None => download_tool(
+                "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+                &ytdlp,
+                "yt-dlp",
+                tx,
+            )?,
+        }
     }
     let ff = ffmpeg_path();
+    let fp = tools_dir().join("ffprobe.exe");
     if !ff.is_file() {
-        let _ = tx.send(Msg::YtStatus("Downloading ffmpeg...".into()));
-        let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build().map_err(|e| e.to_string())?;
-        let resp = client.get("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip").send().map_err(|e| format!("ffmpeg download failed: {}", e))?;
-        let bytes = resp.bytes().map_err(|e| e.to_string())?;
         let _ = tx.send(Msg::YtStatus("Extracting ffmpeg...".into()));
-        let mut cur = std::io::Cursor::new(bytes);
-        let mut za = zip::ZipArchive::new(&mut cur).map_err(|e| format!("bad ffmpeg archive: {}", e))?;
-        for i in 0..za.len() {
-            let mut f = za.by_index(i).map_err(|e| e.to_string())?;
-            let name = f.name().replace('\\', "/");
-            let fname = name.rsplit('/').next().unwrap_or("").to_string();
-            if fname == "ffmpeg.exe" || fname == "ffprobe.exe" {
-                let target = tools_dir().join(&fname);
-                let mut out = File::create(&target).map_err(|e| e.to_string())?;
-                std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+        match EMBEDDED_FFMPEG {
+            Some(b) => write_bin(&ff, b, "ffmpeg")?,
+            None => {
+                let _ = tx.send(Msg::YtStatus("Downloading ffmpeg...".into()));
+                let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build().map_err(|e| e.to_string())?;
+                let resp = client.get("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip").send().map_err(|e| format!("ffmpeg download failed: {}", e))?;
+                let bytes = resp.bytes().map_err(|e| e.to_string())?;
+                let _ = tx.send(Msg::YtStatus("Extracting ffmpeg...".into()));
+                let mut cur = std::io::Cursor::new(bytes);
+                let mut za = zip::ZipArchive::new(&mut cur).map_err(|e| format!("bad ffmpeg archive: {}", e))?;
+                for i in 0..za.len() {
+                    let mut f = za.by_index(i).map_err(|e| e.to_string())?;
+                    let name = f.name().replace('\\', "/");
+                    let fname = name.rsplit('/').next().unwrap_or("").to_string();
+                    if fname == "ffmpeg.exe" || fname == "ffprobe.exe" {
+                        let target = tools_dir().join(&fname);
+                        let mut out = File::create(&target).map_err(|e| e.to_string())?;
+                        std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+                    }
+                }
+                if !ff.is_file() {
+                    return Err("ffmpeg extraction produced no ffmpeg.exe".into());
+                }
             }
         }
-        if !ff.is_file() {
-            return Err("ffmpeg extraction produced no ffmpeg.exe".into());
+    }
+    if !fp.is_file() {
+        match EMBEDDED_FFPROBE {
+            Some(b) => write_bin(&fp, b, "ffprobe")?,
+            None => {
+                if !ff.is_file() {
+                    return Err("ffprobe missing and not embedded; run online once".into());
+                }
+                let _ = tx.send(Msg::YtStatus("Extracting ffprobe...".into()));
+                let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build().map_err(|e| e.to_string())?;
+                let resp = client.get("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip").send().map_err(|e| format!("ffprobe download failed: {}", e))?;
+                let bytes = resp.bytes().map_err(|e| e.to_string())?;
+                let mut cur = std::io::Cursor::new(bytes);
+                let mut za = zip::ZipArchive::new(&mut cur).map_err(|e| format!("bad ffmpeg archive: {}", e))?;
+                for i in 0..za.len() {
+                    let mut f = za.by_index(i).map_err(|e| e.to_string())?;
+                    let name = f.name().replace('\\', "/");
+                    let fname = name.rsplit('/').next().unwrap_or("").to_string();
+                    if fname == "ffprobe.exe" {
+                        let target = tools_dir().join(&fname);
+                        let mut out = File::create(&target).map_err(|e| e.to_string())?;
+                        std::io::copy(&mut f, &mut out).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1605,6 +1725,7 @@ struct PlayerApp {
     playing: String,
     art_tex: Option<TextureHandle>,
     art_state: u8,
+    art_local_valid: bool,
     display_cache: Vec<String>,
     search_query: String,
     yt_query: String,
@@ -1685,6 +1806,15 @@ struct PlayerApp {
     video_dims: (u32, u32),
     video_tex: Option<egui::TextureHandle>,
     video_pos: egui::Pos2,
+    video_fs: bool,
+    video_sink: Option<Sink>,
+    video_audio_proc: Option<Child>,
+    video_bar_visible: bool,
+    video_queue: Vec<String>,
+    video_queue_idx: usize,
+    video_gen: u64,
+    video_closing: bool,
+    video_queue_pin: bool,
     random_on: bool,
     switch_accum: f32,
 }
@@ -1766,6 +1896,7 @@ impl PlayerApp {
             playing: String::new(),
             art_tex: None,
             art_state: 0,
+            art_local_valid: false,
             display_cache,
             search_query: String::new(),
             yt_query: String::new(),
@@ -1819,6 +1950,15 @@ impl PlayerApp {
             video_dims: (640, 360),
             video_tex: None,
             video_pos: egui::pos2(60.0, 60.0),
+            video_fs: false,
+            video_sink: None,
+            video_audio_proc: None,
+            video_bar_visible: false,
+            video_queue: Vec::new(),
+            video_queue_idx: 0,
+            video_gen: 0,
+            video_closing: false,
+            video_queue_pin: false,
             random_on: true,
             switch_accum: 0.0,
             bands_path,
@@ -1835,7 +1975,7 @@ impl PlayerApp {
             show_eq: false,
             search_focus: false,
             yt_focus: false,
-            eq_on: true,
+            eq_on: false,
             eq_custom: None,
             lyrics: None,
             lyrics_title: String::new(),
@@ -2009,6 +2149,7 @@ impl PlayerApp {
                 }
                 Msg::ArtLocal { bytes } => {
                     if let Some(b) = bytes {
+                        self.art_local_valid = true;
                         self.load_art_texture(b);
                     } else if self.want_web {
                         let (a, al) = (self.meta.1.clone(), self.meta.2.clone());
@@ -2017,7 +2158,7 @@ impl PlayerApp {
                 }
                 Msg::ArtWeb { bytes } => {
                     if let Some(b) = bytes {
-                        if self.want_web {
+                        if self.want_web && !self.art_local_valid {
                             self.load_art_texture(b);
                         }
                     }
@@ -2038,11 +2179,16 @@ impl PlayerApp {
                         self.eq_dirty = false;
                         if !was_dirty {
                             if let Some(p) = p {
-                                self.swap_eq(&p);
+                                if self.state.current_song.as_deref() == Some(p.as_str()) {
+                                    self.swap_eq(&p);
+                                } else {
+                                    gc_eq_files(self.eq_req_id);
+                                }
                             }
-                        }
-                        if was_dirty {
+                        } else if let Some(p) = p {
+                            gc_eq_files(self.eq_req_id);
                             self.restart_current();
+                            let _ = p;
                         }
                     } else if self.eq_pending.is_none() && self.eq_dirty {
                         self.eq_dirty = false;
@@ -2055,10 +2201,7 @@ impl PlayerApp {
                     if current {
                         if let Some(p) = self.eq_pending.take() {
                             self.eq_dirty = false;
-                            self.set_error(format!("EQ rendering failed: {}", stem(&p)));
-                            if self.play_started.is_none() {
-                                self.do_play(&p, &p);
-                            }
+                            self.set_error(format!("EQ failed for: {} (using original)", stem(&p)));
                         }
                         if was_dirty {
                             self.restart_current();
@@ -2145,8 +2288,14 @@ impl PlayerApp {
                     let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                     self.video_tex = Some(self.ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
                 }
-                Msg::VideoClosed => {
+                Msg::VideoClosed { gen } => {
+                    let was_playing = gen == self.video_gen && !self.video_closing;
+                    let advance = was_playing && !self.video_queue.is_empty();
                     self.video_on = false;
+                    self.video_closing = false;
+                    if advance {
+                        self.queue_next();
+                    }
                 }
             }
         }
@@ -2187,22 +2336,15 @@ impl PlayerApp {
 
         let use_eq = self.eq_on && self.state.eq_preset != "Flat";
         if use_eq {
-            if self.eq_pending.is_some() {
-                self.eq_pending = None;
-            }
             self.eq_req_id += 1;
             let rid = self.eq_req_id;
             self.eq_dirty = false;
             self.eq_pending = Some(path.to_string());
-            self.sink.stop();
-            self.play_started = None;
-            self.pos = 0.0;
-            self.len_secs = 0.0;
-            self.set_status(format!("EQ processing: {}...", stem(path)));
+            self.do_play(path, path);
             let bands = self.play_bands();
+            self.set_status(format!("EQ processing: {}...", stem(path)));
             let _ = self.lib_tx.send(LibCmd::EqEncode(rid, path.to_string(), bands.to_vec()));
             self.send_meta_art(path.to_string());
-            let _ = self.ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{} - processing EQ - {}", APP_NAME, stem(path))));
             return;
         }
         self.do_play(path, path);
@@ -2212,6 +2354,7 @@ impl PlayerApp {
         self.meta = (stem(&path), "Unknown".to_string(), "Unknown".to_string());
         self.art_tex = None;
         self.art_state = 1;
+        self.art_local_valid = false;
         let _ = self.lib_tx.send(LibCmd::Meta(path.clone()));
         let _ = self.lib_tx.send(LibCmd::ArtLocal(path));
     }
@@ -2222,13 +2365,9 @@ impl PlayerApp {
         } else {
             audio.to_string()
         };
-        let f = match File::open(&src_path) {
-            Ok(f) => f,
-            Err(_) => { self.set_error(format!("Cannot open: {}", stem(display))); return; }
-        };
-        let src = match Decoder::new(BufReader::new(f)) {
-            Ok(s) => s,
-            Err(_) => {
+        let src = match open_decoder(&src_path) {
+            Some(s) => s,
+            None => {
                 if src_path != audio {
                     self.set_error(format!("Cached transcode unreadable: {}", stem(display)));
                     return;
@@ -2297,22 +2436,24 @@ impl PlayerApp {
     }
 
     fn swap_eq(&mut self, cur: &str) {
-        let f = match File::open(eq_tmp_path().to_string_lossy().as_ref()) {
-            Ok(f) => f,
-            Err(_) => { self.set_error("EQ render missing"); return; }
+        let out = eq_out_path(self.eq_req_id);
+        let src = match open_decoder(&out.to_string_lossy()) {
+            Some(s) => s,
+            None => {
+                gc_eq_files(self.eq_req_id);
+                self.set_error("EQ render unreadable, continuing original");
+                return;
+            }
         };
-        let src = match Decoder::new(BufReader::new(f)) {
-            Ok(s) => s,
-            Err(_) => { self.set_error("EQ render unreadable"); return; }
-        };
+        gc_eq_files(self.eq_req_id);
+        let pos = self.pos.max(0.0);
         self.sink.stop();
         self.sink.set_volume(self.state.volume as f32 / 100.0);
         self.sink.append(src);
         self.sink.play();
         self.state.is_paused = false;
         self.play_started = Some(Instant::now());
-        let d = Duration::from_secs_f32(self.pos.max(0.0));
-        if self.sink.try_seek(d).is_ok() {
+        if self.sink.try_seek(Duration::from_secs_f32(pos)).is_ok() {
             self.pos = self.sink.get_pos().as_secs_f32();
         } else {
             self.pos = 0.0;
@@ -2335,19 +2476,19 @@ impl PlayerApp {
         let rid = self.eq_req_id;
         self.eq_dirty = false;
         let use_eq = self.eq_on && self.state.eq_preset != "Flat";
-        self.eq_resume = Some(Duration::from_secs_f32(self.pos.max(0.0)));
         if use_eq {
             self.eq_pending = Some(cur.clone());
             self.set_status(format!("Applying EQ: {}...", stem(&cur)));
             let bands = self.eq_cur();
             let _ = self.lib_tx.send(LibCmd::EqEncode(rid, cur.clone(), bands.to_vec()));
         } else {
-            self.set_status(format!("Applying EQ: {}...", stem(&cur)));
-            self.sink.stop();
-            self.play_started = None;
-            self.pos = 0.0;
-            self.len_secs = 0.0;
+            self.eq_pending = None;
+            let pos = self.pos.max(0.0);
             self.do_play(&cur, &cur);
+            if self.sink.try_seek(Duration::from_secs_f32(pos)).is_ok() {
+                self.pos = self.sink.get_pos().as_secs_f32();
+            }
+            self.set_status(format!("EQ off: {}", stem(&cur)));
         }
     }
 
@@ -2366,28 +2507,26 @@ impl PlayerApp {
         let song = if self.disc_in {
             let i = self.state.current_song.as_ref().and_then(|c| pl.iter().position(|p| p == c)).unwrap_or(0);
             pl[(i + 1) % pl.len()].clone()
+        } else if self.state.playlist_only_mode && self.state.playlist_only_sequential {
+            pl[self.state.song_count as usize % pl.len()].clone()
         } else if !self.random_on {
             let i = self.state.current_song.as_ref().and_then(|c| pl.iter().position(|p| p == c)).unwrap_or(0);
             pl[(i + 1) % pl.len()].clone()
         } else if self.state.playlist_only_mode {
-            if self.state.playlist_only_sequential {
-                pl[self.state.song_count as usize % pl.len()].clone()
-            } else {
-                weighted_pick(&pl, &weights)
-            }
+            random_next(self.state.current_song.as_deref(), &pl, &weights)
         } else if self.state.dir_sequential {
             if let Some(dir) = self.state.current_dir.clone() {
                 let files = collect_audio(&dir);
                 if !files.is_empty() {
                     files[self.state.song_count as usize % files.len()].clone()
                 } else {
-                    weighted_pick(&pl, &weights)
+                    random_next(self.state.current_song.as_deref(), &pl, &weights)
                 }
             } else {
-                weighted_pick(&pl, &weights)
+                random_next(self.state.current_song.as_deref(), &pl, &weights)
             }
         } else {
-            weighted_pick(&pl, &weights)
+            random_next(self.state.current_song.as_deref(), &pl, &weights)
         };
         self.state.skip_count += 1;
         self.play_song(&song);
@@ -2959,31 +3098,28 @@ impl PlayerApp {
         self.set_status(format!("Theme: {}", self.state.theme));
     }
 
+    #[allow(dead_code)]
     fn cycle_eq(&mut self) {
-        let idx = EQ_PRESETS.iter().position(|p| p.name == self.state.eq_preset).unwrap_or(0);
-        self.state.eq_preset = EQ_PRESETS[(idx + 1) % EQ_PRESETS.len()].name.to_string();
-        self.eq_custom = None;
-        self.set_status(format!("EQ: {}", self.state.eq_preset));
-        self.restart_current();
+        self.eq_locked_notice();
     }
 
+    #[allow(dead_code)]
     fn cycle_eq_back(&mut self) {
-        let idx = EQ_PRESETS.iter().position(|p| p.name == self.state.eq_preset).unwrap_or(0);
-        self.state.eq_preset = EQ_PRESETS[(idx + EQ_PRESETS.len() - 1) % EQ_PRESETS.len()].name.to_string();
-        self.eq_custom = None;
-        self.set_status(format!("EQ: {}", self.state.eq_preset));
-        self.restart_current();
+        self.eq_locked_notice();
     }
 
-    fn eq_set(&mut self, i: usize, v: f32) {
-        let mut c = self.eq_cur();
-        c[i] = v;
-        self.eq_custom = Some(c);
-        if self.state.eq_preset != "Custom" {
-            self.state.eq_preset = "Custom".to_string();
+    #[allow(dead_code)]
+    fn eq_set(&mut self, _i: usize, _v: f32) {
+        self.eq_locked_notice();
+    }
+
+    fn eq_locked_notice(&mut self) {
+        self.eq_on = false;
+        self.eq_custom = None;
+        if self.state.eq_preset != "Flat" {
+            self.state.eq_preset = "Flat".to_string();
         }
-        self.set_status("EQ: Custom");
-        self.restart_current();
+        self.set_status("EQ disabled: caused issues, forced to Flat");
     }
 
     fn toggle_repeat(&mut self) {
@@ -3119,7 +3255,7 @@ impl PlayerApp {
     }
 
     fn update_playback_state(&mut self) {
-        if self.eq_pending.is_none() && !self.state.is_paused {
+        if !self.state.is_paused {
             if let Some(start) = self.play_started {
                 if start.elapsed() > Duration::from_millis(600) && self.sink.empty() && self.state.current_song.is_some() {
                     let now = Instant::now();
@@ -3204,7 +3340,7 @@ impl PlayerApp {
 
     fn handle_keys(&mut self) {
         let focused = self.ctx.memory(|m| m.focused().is_some());
-        let (space, left, right, up, down, f, f10, esc, shift) = self.ctx.input(|i| {
+        let (space, left, right, up, down, f, f10, esc, shift, alt_enter) = self.ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -3215,6 +3351,7 @@ impl PlayerApp {
                 i.key_pressed(egui::Key::F10),
                 i.key_pressed(egui::Key::Escape),
                 i.modifiers.shift,
+                i.modifiers.alt && i.key_pressed(egui::Key::Enter),
             )
         });
         if !focused {
@@ -3229,7 +3366,16 @@ impl PlayerApp {
             if down { self.decrease_volume(); }
         }
         if f { self.toggle_fullscreen(); }
+        if alt_enter {
+            if self.video_on {
+                self.video_fs = !self.video_fs;
+                self.video_pos = egui::pos2(60.0, 60.0);
+            } else {
+                self.toggle_fullscreen();
+            }
+        }
         if esc && self.fullscreen { self.set_fullscreen(false); }
+        if esc && self.video_fs { self.video_fs = false; }
         if f10 {
             let ctx = self.ctx.clone();
             self.request_quit(&ctx);
@@ -3339,8 +3485,8 @@ impl PlayerApp {
                         th.playing_fg,
                     );
                 }
-                ui.label(RichText::new(format!("EQ: {}", self.eq_name())).color(if self.eq_on { th.playing_fg } else { th.btn_fg }).monospace().size(11.0));
-                if retro_btn(ui, "EQ", if self.show_eq { Color32::from_rgb(255, 240, 160) } else { th.btn_fg }, th.btn_bg).clicked() {
+                ui.label(RichText::new("EQ: DISABLED").color(th.btn_fg).monospace().size(11.0));
+                if retro_btn(ui, "EQ", if self.show_eq { Color32::from_rgb(255, 240, 160) } else { th.btn_fg }, th.btn_bg).on_hover_text("EQ is disabled: it caused playback problems (video stuck loading). Forced to Flat.").clicked() {
                     self.show_eq = !self.show_eq;
                 }
             });
@@ -3981,23 +4127,8 @@ impl PlayerApp {
 
             ui.horizontal_wrapped(|ui| {
                 if retro_btn(ui, &format!("Theme: {}", self.state.theme), th.playing_fg, th.btn_bg).clicked() { self.cycle_theme(); }
-                if retro_btn(ui, "<", th.btn_fg, th.btn_bg).clicked() { self.cycle_eq_back(); }
-                if retro_btn(ui, &format!("EQ: {}", self.eq_name()), if self.eq_on { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() { self.show_eq = !self.show_eq; }
-                if retro_btn(ui, ">", th.btn_fg, th.btn_bg).clicked() { self.cycle_eq(); }
-                if retro_btn(ui, if self.eq_on { "ON" } else { "OFF" }, if self.eq_on { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() {
-                    self.eq_on = !self.eq_on;
-                    if self.eq_on && self.state.eq_preset == "Flat" {
-                        self.state.eq_preset = "Rock".to_string();
-                        self.eq_custom = None;
-                        self.set_status("EQ: ON (Flat -> Rock)");
-                    }
-                    self.restart_current();
-                }
-                if retro_btn(ui, "RESET", th.btn_fg, th.btn_bg).clicked() {
-                    self.eq_custom = None;
-                    if self.state.eq_preset == "Custom" { self.state.eq_preset = "Flat".to_string(); }
-                    self.set_status(format!("EQ: {}", self.state.eq_preset));
-                    self.restart_current();
+                if retro_btn(ui, "EQ: DISABLED (FLAT)", th.btn_fg, th.btn_bg).on_hover_text("EQ is disabled: it caused playback problems (video stuck on LOADING, wrong metadata). Preset is forced to Flat. May be re-enabled in a future build.").clicked() {
+                    self.show_eq = !self.show_eq;
                 }
                 ui.separator();
                 ui.label(RichText::new("Sleep:").color(th.fg).monospace().size(11.0));
@@ -4012,25 +4143,9 @@ impl PlayerApp {
 
             if self.show_eq {
                 ui.group(|ui| {
-                    let cur = self.eq_cur();
-                    let labels = ["60", "170", "310", "600", "1k", "3k", "6k", "12k", "14k", "16k"];
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().slider_width = 100.0;
-                        for i in 0..10 {
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                let mut v = cur[i];
-                                if ui.add(egui::Slider::new(&mut v, -10.0..=10.0).vertical().show_value(false).trailing_fill(true)).changed() {
-                                    self.eq_set(i, v);
-                                }
-                                ui.label(RichText::new(labels[i]).color(th.fg).monospace().size(10.0));
-                                ui.label(RichText::new(format!("{}", cur[i] as i32)).color(Color32::from_gray(130)).monospace().size(9.0));
-                            });
-                        }
-                    });
-                    if self.eq_custom.is_none() {
-                        ui.label(RichText::new("Drag sliders to create a custom curve").color(th.btn_fg).monospace().size(10.0));
-                    }
+                    ui.label(RichText::new("EQ is DISABLED").color(th.playing_fg).monospace().strong().size(12.0));
+                    ui.label(RichText::new("The equalizer forced to Flat because it caused playback problems: videos would get stuck on LOADING and metadata went wrong.").color(th.btn_fg).monospace().size(10.0));
+                    ui.label(RichText::new("It may be re-enabled in a future build after the background EQ encode is reworked.").color(th.btn_fg).monospace().size(10.0));
                 });
             }
 
@@ -4431,7 +4546,17 @@ EQ      : Equalizer presets";
 
     fn fetch_lyrics(&mut self) {
         if let Some(s) = self.state.current_song.clone() {
-            let (artist, title) = (self.meta.1.clone(), self.meta.0.clone());
+            let (mut artist, mut title) = (self.meta.1.clone(), self.meta.0.clone());
+            if artist.is_empty() || artist == "Unknown" {
+                if let Some(idx) = title.find(" - ") {
+                    let a = title[..idx].trim();
+                    let t = title[idx + 3..].trim();
+                    if !a.is_empty() && !t.is_empty() {
+                        artist = a.to_string();
+                        title = t.to_string();
+                    }
+                }
+            }
             self.set_status("Fetching lyrics...");
             let _ = self.net_tx.send(NetCmd::Lyrics(artist, title));
             let _ = s;
@@ -4447,38 +4572,265 @@ EQ      : Equalizer presets";
                 for ext in ["mp4", "mkv", "avi", "webm"] {
                     let vp = dir.join(format!("{}.{}", name, ext));
                     if vp.is_file() {
-                        self.start_video(vp.to_string_lossy().to_string());
+                        self.enqueue_videos(vec![vp.to_string_lossy().to_string()]);
                         return;
                     }
                 }
             }
         }
-        if let Some(p) = rfd::FileDialog::new()
+        if let Some(paths) = rfd::FileDialog::new()
             .add_filter("Video", &["mp4", "mkv", "avi", "webm", "mov"])
-            .pick_file()
+            .pick_files()
         {
-            self.start_video(p.to_string_lossy().to_string());
+            let vids: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+            self.enqueue_videos(vids);
+        }
+    }
+
+    fn play_video_item(&mut self, path: String) {
+        self.video_closing = false;
+        if let Some(mut c) = self.video_audio_proc.take() {
+            let _ = c.kill();
+        }
+        if let Some(s) = self.video_sink.take() {
+            s.stop();
+        }
+        self.video_gen += 1;
+        let gen = self.video_gen;
+        let _ = self.lib_tx.send(LibCmd::VideoOpen(path.clone(), gen));
+        self.video_on = true;
+        self.video_paused = false;
+        self.video_pos = egui::pos2(60.0, 60.0);
+        self.video_tex = None;
+        self.video_bar_visible = false;
+        match spawn_video_audio(&path, &ffmpeg_path()) {
+            Ok((mut child, pipe)) => {
+                if let Ok(mut sink) = Sink::try_new(&self._stream_handle) {
+                    sink.set_volume(self.state.volume as f32 / 100.0 * 0.9);
+                    sink.append(pipe);
+                    sink.play();
+                    self.video_audio_proc = Some(child);
+                    self.video_sink = Some(sink);
+                } else {
+                    let _ = child.kill();
+                }
+            }
+            Err(e) => self.set_status(format!("MOVIE (video only): {}", e)),
+        }
+        self.set_status(format!("MOVIE {}/{}: {}", self.video_queue_idx + 1, self.video_queue.len(), stem(&path)));
+    }
+
+    fn enqueue_videos(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        if !self.video_on && self.video_queue.is_empty() {
+            self.video_queue = paths;
+            self.video_queue_idx = 0;
+            self.play_video_item(self.video_queue[0].clone());
         } else {
-            self.set_error("No matching video found");
+            let n = self.video_queue.len();
+            self.video_queue.extend(paths);
+            self.set_status(format!("Queued {} video(s) -> {}", self.video_queue.len() - n, self.video_queue.len()));
+        }
+    }
+
+    fn play_queue_idx(&mut self, idx: usize) {
+        if idx < self.video_queue.len() {
+            self.video_queue_idx = idx;
+            self.play_video_item(self.video_queue[idx].clone());
+        }
+    }
+
+    fn queue_next(&mut self) {
+        if self.video_queue.is_empty() {
+            return;
+        }
+        let ni = (self.video_queue_idx + 1) % self.video_queue.len();
+        self.play_queue_idx(ni);
+    }
+
+    fn queue_prev(&mut self) {
+        if self.video_queue.is_empty() {
+            return;
+        }
+        let pi = (self.video_queue_idx + self.video_queue.len() - 1) % self.video_queue.len();
+        self.play_queue_idx(pi);
+    }
+
+    fn remove_queue_item(&mut self, idx: usize) {
+        if idx < self.video_queue.len() {
+            self.video_queue.remove(idx);
+            if self.video_queue.is_empty() {
+                return;
+            }
+            if idx < self.video_queue_idx {
+                self.video_queue_idx -= 1;
+            }
+            if self.video_queue_idx >= self.video_queue.len() {
+                self.video_queue_idx = self.video_queue.len() - 1;
+            }
         }
     }
 
     fn start_video(&mut self, path: String) {
-        let _ = self.lib_tx.send(LibCmd::VideoOpen(path.clone()));
-        self.video_on = true;
-        self.video_paused = false;
-        self.video_pos = egui::pos2(60.0, 60.0);
-        self.set_status(format!("MOVIE: {}", stem(&path)));
+        if !self.video_on && self.video_queue.is_empty() {
+            self.video_queue = vec![path];
+            self.video_queue_idx = 0;
+            self.play_video_item(self.video_queue[0].clone());
+        } else {
+            let n = self.video_queue.len();
+            self.video_queue.push(path);
+            self.set_status(format!("Queued -> {}", self.video_queue.len()));
+            let _ = n;
+        }
     }
 
     fn close_video(&mut self) {
+        self.video_closing = true;
         let _ = self.lib_tx.send(LibCmd::VideoClose);
         self.video_on = false;
         self.video_tex = None;
+        self.video_fs = false;
+        if let Some(mut c) = self.video_audio_proc.take() {
+            let _ = c.kill();
+        }
+        if let Some(s) = self.video_sink.take() {
+            s.stop();
+        }
     }
 
     fn video_window(&mut self, ctx: &egui::Context) {
         let (w, h) = self.video_dims;
+        if self.video_fs {
+            let scr = ctx.viewport_rect();
+            let sw = scr.width();
+            let sh = scr.height();
+            let (iw, ih) = if w > 0 && h > 0 { (w as f32, h as f32) } else { (16.0, 9.0) };
+            let scale = (sw / iw).min(sh / ih);
+            let vw = iw * scale;
+            let vh = ih * scale;
+            let img = egui::Rect::from_center_size(scr.center(), egui::vec2(vw, vh));
+            let mouse = ctx.input(|i| i.pointer.latest_pos());
+            let hovering = mouse.map_or(false, |m| m.y <= scr.min.y + 34.0 && m.x >= scr.min.x && m.x <= scr.max.x);
+            self.video_bar_visible = hovering || self.video_queue_pin;
+            let mut close = false;
+            let mut togg = false;
+            let mut next = false;
+            let mut prev = false;
+            let mut add = false;
+            let mut play_idx: Option<usize> = None;
+            let mut del_idx: Option<usize> = None;
+            let mut clearq = false;
+            egui::Area::new(egui::Id::new("movie_win"))
+                .fixed_pos(scr.min)
+                .constrain(false)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let resp = ui.allocate_response(scr.size(), egui::Sense::click_and_drag());
+                    let rect = resp.rect;
+                    ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+                    if let Some(tex) = &self.video_tex {
+                        ui.painter().image(tex.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    } else {
+                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "LOADING...", egui::FontId::monospace(14.0), Color32::from_gray(140));
+                    }
+                    if self.video_paused {
+                        ui.painter().rect_stroke(img, 0.0, egui::Stroke::new(3.0, Color32::from_rgb(255, 220, 80)), egui::StrokeKind::Inside);
+                    }
+                    if self.video_bar_visible {
+                        let bar = egui::Rect::from_min_size(scr.min, egui::vec2(sw, 30.0));
+                        ui.painter().rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(8.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new("CLOSE")).clicked() {
+                            close = true;
+                        }
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(104.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(if self.video_paused { "PLAY" } else { "PAUSE" })).clicked() {
+                            togg = true;
+                        }
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(200.0, 4.0), egui::vec2(56.0, 22.0)), egui::Button::new("<<")).clicked() {
+                            prev = true;
+                        }
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(264.0, 4.0), egui::vec2(56.0, 22.0)), egui::Button::new(">>")).clicked() {
+                            next = true;
+                        }
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(352.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new("+ ADD")).clicked() {
+                            add = true;
+                        }
+                        let qu_lbl = if self.video_queue_pin { "HIDE QUEUE" } else { "SHOW QUEUE" };
+                        if ui.put(egui::Rect::from_min_size(scr.max - egui::vec2(140.0, 26.0), egui::vec2(128.0, 22.0)), egui::Button::new(qu_lbl)).clicked() {
+                            self.video_queue_pin = !self.video_queue_pin;
+                        }
+                    }
+                    if self.video_bar_visible && !self.video_queue.is_empty() {
+                        let qw = 300.0f32;
+                        let qrect = egui::Rect::from_min_max(
+                            egui::pos2(scr.max.x - qw, scr.min.y + 32.0),
+                            egui::pos2(scr.max.x, scr.max.y),
+                        );
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(qrect), |ui| {
+                            ui.painter().rect_filled(qrect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 190));
+                            ui.painter().rect_stroke(qrect, 0.0, egui::Stroke::new(1.0, Color32::from_gray(60)), egui::StrokeKind::Inside);
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("QUEUE").color(Color32::from_rgb(120, 255, 120)).monospace().strong().size(12.0));
+                                ui.label(RichText::new(format!(" {} ", self.video_queue.len())).color(Color32::from_gray(170)).monospace().size(11.0));
+                                if ui.small_button("CLEAR").clicked() { clearq = true; }
+                            });
+                            ui.separator();
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                let mut remove_here: Option<usize> = None;
+                                let mut play_here: Option<usize> = None;
+                                for (i, p) in self.video_queue.iter().enumerate() {
+                                    let is_cur = i == self.video_queue_idx && self.video_on;
+                                    ui.horizontal(|ui| {
+                                        let col = if is_cur { Color32::from_rgb(255, 220, 80) } else { Color32::from_gray(200) };
+                                        let txt = format!("{:02}  {}", i + 1, stem(p));
+                                        let label = RichText::new(txt).color(col).monospace().size(11.0);
+                                        let resp = ui.add(egui::Label::new(label).truncate());
+                                        if resp.clicked() {
+                                            play_here = Some(i);
+                                        }
+                                        if ui.small_button("✕").clicked() {
+                                            remove_here = Some(i);
+                                        }
+                                    });
+                                }
+                                if let Some(i) = play_here { play_idx = Some(i); }
+                                if let Some(i) = remove_here { del_idx = Some(i); }
+                            });
+                        });
+                    }
+                    if resp.double_clicked() {
+                        togg = true;
+                    }
+                });
+            if let Some(i) = play_idx { self.play_queue_idx(i); }
+            if let Some(i) = del_idx { self.remove_queue_item(i); }
+            if clearq { self.video_queue.clear(); self.video_queue_idx = 0; }
+            if add {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mkv", "avi", "webm", "mov"])
+                    .pick_files()
+                {
+                    let vids: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+                    self.enqueue_videos(vids);
+                }
+            }
+            if prev { self.queue_prev(); }
+            if next { self.queue_next(); }
+            if togg {
+                self.video_paused = !self.video_paused;
+                let _ = self.lib_tx.send(LibCmd::VideoPause(self.video_paused));
+                if let Some(s) = &self.video_sink {
+                    if self.video_paused { s.pause(); } else { s.play(); }
+                }
+                self.set_status(if self.video_paused { "MOVIE: paused" } else { "MOVIE: playing" });
+            }
+            if close {
+                self.close_video();
+            }
+            return;
+        }
         let vw = 480.0f32;
         let vh = if h > 0 { vw * h as f32 / w as f32 } else { 270.0 };
         let mut close = false;
@@ -4519,12 +4871,16 @@ EQ      : Equalizer presets";
                         ui.horizontal(|ui| {
                             if ui.button("Close").clicked() { close = true; }
                             if ui.button(if self.video_paused { "Play" } else { "Pause" }).clicked() { togg = true; }
+                            if ui.button("Fullscreen [Alt+Enter]").clicked() { self.video_fs = true; }
                         });
                     });
             });
         if togg {
             self.video_paused = !self.video_paused;
             let _ = self.lib_tx.send(LibCmd::VideoPause(self.video_paused));
+            if let Some(s) = &self.video_sink {
+                if self.video_paused { s.pause(); } else { s.play(); }
+            }
             self.set_status(if self.video_paused { "MOVIE: paused" } else { "MOVIE: playing" });
         }
         if close {
@@ -4694,6 +5050,24 @@ fn weighted_pick(pl: &[String], weights: &HashMap<String, f32>) -> String {
     pl[0].clone()
 }
 
+fn random_next(current: Option<&str>, pl: &[String], weights: &HashMap<String, f32>) -> String {
+    let s = weighted_pick(pl, weights);
+    if pl.len() > 1 && current == Some(s.as_str()) {
+        if let Some(i) = pl.iter().position(|p| *p == s) {
+            return pl[(i + 1) % pl.len()].clone();
+        }
+    }
+    s
+}
+
+fn open_decoder(path: &str) -> Option<Decoder<BufReader<File>>> {
+    let f = File::open(path).ok()?;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Decoder::new(BufReader::new(f)))) {
+        Ok(Ok(d)) => Some(d),
+        _ => None,
+    }
+}
+
 fn make_display(path: &str) -> String {
     let folder = Path::new(path)
         .parent()
@@ -4802,6 +5176,18 @@ fn load_bands(path: &std::path::Path) -> HashMap<String, Vec<String>> {
 }
 
 fn main() -> eframe::Result {
+std::panic::set_hook(Box::new(|info| {
+        use std::io::Write as _;
+        let bt = std::backtrace::Backtrace::force_capture();
+        let log = data_dir().join("crash.log");
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            let _ = writeln!(f, "\n===== panic at {} =====", ts);
+            let _ = writeln!(f, "{}", info);
+            let _ = writeln!(f, "{}", bt);
+        }
+        eprintln!("{}", info);
+    }));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
@@ -4851,16 +5237,16 @@ mod eq_dsp_tests {
                 w.write_sample((v * 32767.0) as i16).unwrap();
             }
         }
-        let out = eq_tmp_path();
+        let out = std::env::temp_dir().join("mediaplayerofdoom_eqtest.wav");
         let _ = std::fs::remove_file(&out);
-        encode_eq(src.to_string_lossy().as_ref(), &[8.0, 6.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).expect("encode ok");
+        encode_eq(src.to_string_lossy().as_ref(), &[8.0, 6.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &out).expect("encode ok");
         assert!(out.is_file(), "eq output file exists");
         let a = rms(&src);
         let b = rms(&out);
         assert!(b > a * 1.5, "EQ should boost RMS: in={:.4} out={:.4}", a, b);
 
         let _ = std::fs::remove_file(&out);
-        encode_eq(src.to_string_lossy().as_ref(), &[-8.0, -6.0, -4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).expect("cut ok");
+        encode_eq(src.to_string_lossy().as_ref(), &[-8.0, -6.0, -4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &out).expect("cut ok");
         let c = rms(&out);
         assert!(c < a * 0.9, "EQ cut should reduce RMS: in={:.4} out={:.4}", a, c);
 
@@ -4883,9 +5269,9 @@ mod eq_dsp_tests {
             _ => return,
         };
         let a1 = std::fs::read(&real).expect("read real song");
-        let out = eq_tmp_path();
+        let out = std::env::temp_dir().join("mediaplayerofdoom_eqtest_real.wav");
         let _ = std::fs::remove_file(&out);
-        encode_eq(&real, &[6.0, 5.0, 3.0, -2.0, 2.0, 6.0, 7.0, 6.0, 5.0, 4.0]).expect("real song encodes");
+        encode_eq(&real, &[6.0, 5.0, 3.0, -2.0, 2.0, 6.0, 7.0, 6.0, 5.0, 4.0], &out).expect("real song encodes");
         let a2 = std::fs::read(&out).expect("read eq output");
         assert!(!wav_bool(&a1), "source of a compressed song should not be a wav");
         assert!(wav_bool(&a2), "eq output is a wav file");
