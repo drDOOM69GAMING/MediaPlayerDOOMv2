@@ -16,6 +16,9 @@ A retro DOOM-styled media player for Windows, rendered in egui. Tape, CD, and Ra
   - True fullscreen playback with letterboxing
   - Auto-hiding top bar (mouse to the top of the screen to reveal) with PLAY/PAUSE, prev/next, **+ ADD** (multi-file picker), and show/hide queue
   - Right-side queue panel with per-item play, remove, and CLEAR; auto-advances when a video ends
+  - **Automatic intro/credits detection**: when **SKIP: ON**, the app analyzes each video's audio and finds where the intro ends and the credits/outro begins, then auto-skips the intro and jumps to the next video at the credits. Detected times are remembered per file and per folder
+  - **Manual markers**: use the top bar **INTRO** / **CREDS** buttons to set the intro-end and credits-start for the current video at the current playback position; values persist per file/folder across runs
+  - The top bar and queue stay visible while your mouse is over the queue panel, so you can scroll it and press CLEAR without the bar disappearing
 - **Album art**: local `cover/folder` art always wins; online lookup only as a fallback when no local art exists (so pictures never get replaced by wrong web matches)
 - **Lyrics**: Artist/Track auto-detected from the filename when tags are unknown
 - **Playlist management**: drag-to-reorder, save/load JSON, playlist-only mode, sequential mode, per-CD directory ordering
@@ -46,6 +49,13 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 - The equalizer is currently **locked to FLAT** and shows a hover hint explaining why. It caused playback problems (videos stuck loading, bogus metadata) when enabled, so it has been disabled until the background EQ encode is reworked in a future build. Band changes / preset cycling / the ON-OFF toggle are disabled.
 - If you build from source and have `tools/ffmpeg.exe`, `tools/ffprobe.exe`, `tools/yt-dlp.exe` next to `Cargo.toml`, they are embedded into the exe by `build.rs` (that folder is gitignored). Without them the app falls back to downloading on first run.
 - The easter egg only shows when the right panel is pulled out.
+
+## v2.4.0 changelog
+
+- **Automatic intro/credits detection**: videos with **SKIP: ON** are analyzed on play — the app measures the audio front/back, finds where the intro ends and credits/outro begins, then auto-skips the intro and hops to the next video when credits roll.
+- **Manual INTRO / CREDS markers** in the video top bar: click during playback to mark intro-end or credits-start at the current position for that file/folder; persisted in settings.
+- **Queue stays open while you use it**: the bar and the queue panel no longer vanish the instant your mouse leaves the top strip — hovering the queue region keeps everything visible so you can scroll, play rows, and hit CLEAR.
+- **Per-file + per-folder skip memory**: detected and manual bound times are stored both for the exact file and for its folder, so the whole series skips consistently.
 
 ## v2.3.0 changelog
 
