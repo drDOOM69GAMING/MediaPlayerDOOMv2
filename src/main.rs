@@ -1100,6 +1100,7 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                     .args(["-an", "-vf", "scale=640:360", "-r", "24", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
+                    .creation_flags(NO_WINDOW)
                     .spawn()
                 {
                     Ok(c) => c,
@@ -2289,12 +2290,15 @@ impl PlayerApp {
                     self.video_tex = Some(self.ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
                 }
                 Msg::VideoClosed { gen } => {
-                    let was_playing = gen == self.video_gen && !self.video_closing;
-                    let advance = was_playing && !self.video_queue.is_empty();
-                    self.video_on = false;
-                    self.video_closing = false;
-                    if advance {
-                        self.queue_next();
+                    let was_eof = gen == self.video_gen && !self.video_closing;
+                    if was_eof {
+                        self.video_on = false;
+                        self.video_bar_visible = false;
+                        if !self.video_queue.is_empty() {
+                            self.queue_next();
+                        } else {
+                            self.video_tex = None;
+                        }
                     }
                 }
             }
@@ -4624,14 +4628,16 @@ EQ      : Equalizer presets";
         if paths.is_empty() {
             return;
         }
-        if !self.video_on && self.video_queue.is_empty() {
-            self.video_queue = paths;
-            self.video_queue_idx = 0;
-            self.play_video_item(self.video_queue[0].clone());
-        } else {
+        if self.video_on {
             let n = self.video_queue.len();
             self.video_queue.extend(paths);
             self.set_status(format!("Queued {} video(s) -> {}", self.video_queue.len() - n, self.video_queue.len()));
+        } else {
+            let s = self.video_queue.len();
+            self.video_queue.extend(paths);
+            let first = self.video_queue[s].clone();
+            self.video_queue_idx = s;
+            self.play_video_item(first);
         }
     }
 
@@ -4674,15 +4680,16 @@ EQ      : Equalizer presets";
     }
 
     fn start_video(&mut self, path: String) {
-        if !self.video_on && self.video_queue.is_empty() {
-            self.video_queue = vec![path];
-            self.video_queue_idx = 0;
-            self.play_video_item(self.video_queue[0].clone());
-        } else {
+        if self.video_on {
             let n = self.video_queue.len();
             self.video_queue.push(path);
             self.set_status(format!("Queued -> {}", self.video_queue.len()));
             let _ = n;
+        } else {
+            self.video_queue.push(path);
+            let last = self.video_queue.len() - 1;
+            self.video_queue_idx = last;
+            self.play_video_item(self.video_queue[last].clone());
         }
     }
 
