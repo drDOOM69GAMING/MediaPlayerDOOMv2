@@ -47,6 +47,21 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 - If you build from source and have `tools/ffmpeg.exe`, `tools/ffprobe.exe`, `tools/yt-dlp.exe` next to `Cargo.toml`, they are embedded into the exe by `build.rs` (that folder is gitignored). Without them the app falls back to downloading on first run.
 - The easter egg only shows when the right panel is pulled out.
 
+## v2.3.0 changelog
+
+- **REW/FWD buttons now work with a click** (10 second skip) in addition to press-and-hold winding.
+- **CD last-folder memory**: inserting a disc remembers the last folder used.
+- **All-band A-Z ordering**: the ALL button sorts bands alphabetically, songs within each band by title.
+- **CD to Tape restore**: switching from CD mode to Tape always restores the full A-Z library playlist.
+- **Currently-playing playlist index**: the app tracks which playlist row is playing for reliable highlight and playback.
+- **Resume tape state fix**: resuming a tape now correctly sets the current song and playing state before playback begins.
+- **Random/shuffle fallback**: shuffle and dir-sequential modes always find a valid playlist index so playback doesn't lose track.
+- **Help window expanded**: full documentation of keyboard shortcuts, deck controls (Tape/CD/Radio), tune slider, playlist controls, and extras.
+- **Duplicate Radio button removed** from the button bar.
+- **Scroll-follow removed**: playlist scrolls freely without locking to the playing song.
+- **Playlist highlight**: the currently playing song is marked with a filled triangle and colored text in the playlist.
+- **EQ disabled (forced Flat)**: carried forward from v2.1; the equalizer is locked until the background encode is reworked.
+
 ## v2.1 changelog
 
 - **EQ disabled (forced Flat).** Using the equalizer could wedge the background thread that handles metadata and video decode, causing video to get stuck on "LOADING..." and metadata/pictures to go wrong. A hover hint now explains it; re-enable in a future build after the EQ encode is moved off the shared worker.
