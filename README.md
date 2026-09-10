@@ -54,8 +54,9 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 - **Automatic intro/credits detection**: videos with **SKIP: ON** are analyzed on play — the app measures the audio front/back, finds where the intro ends and credits/outro begins, then auto-skips the intro and hops to the next video when credits roll.
 - **Manual INTRO / CREDS markers** in the video top bar: click during playback to mark intro-end or credits-start at the current position for that file/folder; persisted in settings.
-- **Queue stays open while you use it**: the bar and the queue panel no longer vanish the instant your mouse leaves the top strip — hovering the queue region keeps everything visible so you can scroll, play rows, and hit CLEAR.
+- **Queue stays open while you use it**: the bar and queue show whenever the mouse is over the top strip or the queue panel, and hide the moment it leaves — so you can scroll, play rows, and hit CLEAR without them vanishing mid-use. The old SHOW QUEUE pin toggle is removed.
 - **Per-file + per-folder skip memory**: detected and manual bound times are stored both for the exact file and for its folder, so the whole series skips consistently.
+- **Auto-hide controls**: the fullscreen video top bar and queue appear only while the mouse is over the top strip or the queue panel, and disappear when the mouse leaves — nothing stays stuck on screen.
 
 ## v2.3.0 changelog
 
