@@ -2,6 +2,13 @@ use std::path::Path;
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    let rc = Path::new(&manifest).join("assets").join("app_icon.rc");
+    println!("cargo:rerun-if-changed={}", rc.display());
+    if rc.is_file() {
+        let _ = embed_resource::compile(&rc, embed_resource::NONE);
+    }
+
     let tools = Path::new(&manifest).join("tools");
     let mut out = String::new();
     for (name, const_name) in [

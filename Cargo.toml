@@ -21,6 +21,9 @@ tray-icon = "0.24"
 global-hotkey = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[build-dependencies]
+embed-resource = "2"
+
 [profile.release]
 opt-level = 3
 lto = true
