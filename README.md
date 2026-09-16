@@ -11,7 +11,7 @@ A retro DOOM-styled media player for Windows, rendered in egui. Tape, CD, and Ra
 - **Bands catalog**: songs grouped by artist folder (A-Z, scrollable), rebuilt from whatever folder you add
 - **Play order switch**: flip the retro wall switch under BANDS. ON = random shuffle, OFF = normal in-order playback
 - **Smart shuffle**: weighted by your listening history, or plain shuffle
-- **Live visualizer**: a real-time 12-band spectrum with peak caps in the NOW panel, synced to whatever is playing (music or radio). The deck's bass woofers pump with the volume, rattle on heavy bass, shove downward on beats, and throw expanding shockwave rings
+- **Live visualizer**: a real-time 12-band spectrum with peak caps in the NOW panel, synced to whatever is playing (music or radio). The deck's bass woofers pump with the volume, rattle on heavy bass, shove downward on beats, and pulse an expanding ring on loud hits
 - **Recording**: capture the current track or a live stream (REC on the deck)
 - **Video player**: click **Video** to play the matching movie in-app:
   - True fullscreen playback with letterboxing
@@ -22,8 +22,9 @@ A retro DOOM-styled media player for Windows, rendered in egui. Tape, CD, and Ra
   - The top bar and queue stay visible while your mouse is over the queue panel, so you can scroll it and press CLEAR without the bar disappearing
 - **Album art**: local `cover/folder` art always wins; online lookup only as a fallback when no local art exists (so pictures never get replaced by wrong web matches)
 - **Lyrics**: Artist/Track auto-detected from the filename when tags are unknown
-- **Playlist management**: drag-to-reorder, save/load JSON, playlist-only mode, sequential mode, per-CD directory ordering
+- **Playlist management**: drag-to-reorder, save/load JSON, playlist-only mode, sequential mode, per-CD directory ordering, and a live current-song highlight that scrolls to and marks whatever is playing
 - **System tray** + global hotkeys (media keys)
+- **Taskbar icon**: the app icon is applied directly on the real window handle at launch, so it always shows in the taskbar and Alt-Tab
 - **YouTube**: paste a URL or search term to download audio/video via the embedded yt-dlp
 
 ## Requirements
@@ -57,14 +58,19 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 - The equalizer is currently **locked to FLAT** and shows a hover hint explaining why. It caused playback problems (videos stuck loading, bogus metadata) when enabled, so it has been disabled until the background EQ encode is reworked in a future build. Band changes / preset cycling / the ON-OFF toggle are disabled.
 - If you build from source and have `tools/ffmpeg.exe`, `tools/ffprobe.exe`, `tools/yt-dlp.exe` next to `Cargo.toml`, they are embedded into the exe by `build.rs` (that folder is gitignored). Without them the app falls back to downloading on first run.
 
+## v2.7.0 changelog
+
+- **Playlist now tracks the playing song live**: every track change scrolls the list to center the actual row and marks it green with a play triangle and a filled background, so you always see what is playing. The scroll lands on the right row even as tracks advance.
+- **NOW readout**: a header above the playlist shows exactly which entry is playing, like `NOW 0423/500`, along with the current song name, updating in real time.
+- **Taskbar icon fix**: the app icon is now applied directly on the real window handle instead of relying on the windowing library's self-set access, so the icon shows correctly in the Windows taskbar and Alt-Tab on every launch.
+- **Speaker cleanup**: the thin outer echo circles around the deck speakers were removed for a cleaner look while keeping the cone motion, bass rattle, and pulse ring.
+
 ## v2.6.0 changelog
 
 - **Auto-skip now cuts for real**: with SKIP on AUTO, the manual INTRO and CREDS markers you set are fed to mkvmerge (the same muxer that trims for radio/CD), producing a real cut file that starts at the intro marker, so playback never drifts out of sync with the audio.
 - **Marker buttons survive the first skip**: after an auto-cut, the INTRO / CREDS buttons and the seek bar keep pointing at the same frame times from your original markers, so you still get full control instead of a single one-shot skip. The marker values are carried over to the cut file automatically.
 - **No more mid-play spoiling**: the cut plays from position zero as its own file rather than seeking inside the playlist track, which is what was letting the audio and video fall out of step.
-- **Cuts go to the system temp folder**: cut files are written to your Windows temp directory (not next to your media), old temporary cuts are cleared each time a new cut is made必ed and when the app exits, so nothing piles up on your videos' folders.
-
-(The remaining lines of the README prior to this point are the front-matter and v2.5.0 changelog; see above.)
+- **Cuts go to the system temp folder**: cut files are written to your Windows temp directory (not next to your media), old temporary cuts are cleared each time a new cut is made and when the app exits, so nothing piles up on your videos' folders.
 
 - **Live audio visualizer**: the NOW panel now runs a real-time 12-band spectrum (about 30 Hz to 16 kHz) with peak caps, driven by the actual audio of whatever is playing, including the radio. The bars are loudness-relative, so they follow the music: gold/orange at steady volume, red flashes only on genuine peaks, and they fall away during quiet passages instead of staying pinned at full red.
 - **Punchy bass woofers**: the twin deck speakers analyze the audio and move with it. The cones pump in and out with volume, rattle when the bass kicks, shove downward on beats, and throw expanding shockwave rings; hard hits flash the speaker red.

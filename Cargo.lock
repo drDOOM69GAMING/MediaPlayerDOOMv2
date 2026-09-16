@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "mediaplayerofdoom"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "cpal",
  "eframe",
@@ -2690,6 +2690,7 @@ dependencies = [
  "image",
  "lofty",
  "rand 0.9.5",
+ "raw-window-handle",
  "regex",
  "reqwest",
  "rfd",
@@ -2698,6 +2699,7 @@ dependencies = [
  "serde_json",
  "symphonia",
  "tray-icon",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

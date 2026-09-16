@@ -381,7 +381,7 @@ fn grill_dots(painter: &egui::Painter, rect: egui::Rect, dot: Color32) {
     }
 }
 
-fn speaker_woofer(ui: &mut egui::Ui, d: f32, base: Color32, accent: Color32, pulse: f32, kick: f32) {
+fn speaker_woofer(ui: &mut egui::Ui, d: f32, base: Color32, accent: Color32, pulse: f32, _kick: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
     let painter = ui.painter().with_clip_rect(ui.clip_rect());
     let c0 = rect.center();
@@ -397,8 +397,6 @@ fn speaker_woofer(ui: &mut egui::Ui, d: f32, base: Color32, accent: Color32, pul
     painter.circle_filled(c0, r * 0.88, darken(base, 0.30));
     painter.circle(c0, r * 0.88, Color32::TRANSPARENT, egui::Stroke::new(1.0, lighten(base, 0.08)));
     painter.circle(c0, r * 0.80, Color32::TRANSPARENT, egui::Stroke::new(1.0, darken(base, 0.5)));
-    let echo_r = r * (1.15 + (1.0 - kick) * 0.85);
-    painter.circle(c0, echo_r, Color32::TRANSPARENT, egui::Stroke::new(1.8, accent.linear_multiply(0.05 + kick * 0.55)));
     let surge = 1.0 + pulse * 0.45;
     let flex = r * 0.80 * (1.18 + pulse * 0.34);
     painter.circle(c, flex, Color32::TRANSPARENT, egui::Stroke::new(1.4, mix(base, Color32::BLACK, 0.55 - pulse * 0.35)));
@@ -2409,9 +2407,9 @@ struct PlayerApp {
     art_state: u8,
     art_local_valid: bool,
     display_cache: Vec<String>,
-    playlist_scroll: f32,
     pl_view_h: f32,
     playing_pl_idx: Option<usize>,
+    pl_last_cur: Option<usize>,
     search_query: String,
     yt_query: String,
     eq_pending: Option<String>,
@@ -2541,6 +2539,8 @@ struct PlayerApp {
 
 impl PlayerApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(target_os = "windows")]
+        apply_taskbar_icon(cc);
         let ctx = cc.egui_ctx.clone();
 
         let (stream, handle) = OutputStream::try_default()?;
@@ -2638,9 +2638,9 @@ impl PlayerApp {
             art_state: 0,
             art_local_valid: false,
             display_cache,
-            playlist_scroll: 0.0,
             pl_view_h: 300.0,
             playing_pl_idx: None,
+            pl_last_cur: None,
             search_query: String::new(),
             yt_query: String::new(),
             eq_pending: None,
@@ -3209,6 +3209,7 @@ video_ended: false,
             return;
         }
         self.state.current_song = Some(path.to_string());
+        self.playing_pl_idx = self.state.playlist.iter().position(|p| p == path);
         self.eq_resume = None;
         self.state.prev_songs.push(path.to_string());
         self.state.song_count += 1;
@@ -5344,9 +5345,13 @@ video_ended: false,
 
             let query = self.search_query.to_lowercase();
             let cur_song = self.state.current_song.clone();
-            let cur_idx = self.playing_pl_idx
-                .filter(|i| *i < self.state.playlist.len())
-                .or_else(|| cur_song.as_deref().and_then(|c| self.state.playlist.iter().position(|p| p.as_str() == c)));
+            let cur_idx = cur_song
+                .as_deref()
+                .and_then(|c| self.state.playlist.iter().position(|p| p.as_str() == c))
+                .or_else(|| {
+                    self.playing_pl_idx
+                        .filter(|i| *i < self.state.playlist.len())
+                });
             let rows: Vec<(usize, String)> = self
                 .state
                 .playlist
@@ -5363,19 +5368,60 @@ video_ended: false,
                 .map(|(i, _)| (i, self.display_cache[i].clone()))
                 .collect();
 
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("PLAYLIST").color(darken(th.accent, 0.35)).monospace().strong().size(10.0));
+                let total = self.state.playlist.len();
+                let (now_txt, now_col) = match cur_idx {
+                    Some(ci) => (format!("NOW {:>4}/{}", ci + 1, total), th.playing_fg),
+                    None => (format!("NOW  -/{}", total), Color32::from_gray(90)),
+                };
+                ui.label(RichText::new(now_txt).color(now_col).monospace().size(10.0));
+                let shown = cur_song.as_deref().map(stem).unwrap_or_default();
+                ui.label(RichText::new(truncate_mid(&shown, 42)).color(now_col).monospace().size(10.0));
+            });
+            ui.add_space(2.0);
+
             let mut play_choice: Option<usize> = None;
             let row_h = 20.0;
-            let sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if cur_idx != self.pl_last_cur {
+                self.pl_last_cur = cur_idx;
+                if let Some(ci) = cur_idx {
+                    if let Some(pos) = rows.iter().position(|(i, _)| *i == ci) {
+                        let avail_h = ui.available_height().max(1.0);
+                        let spacing_y = ui.spacing().item_spacing.y;
+                        let sh = row_h + spacing_y;
+                        let target = (pos as f32 * sh) - avail_h * 0.5;
+                        let max_off = (sh * rows.len() as f32 - spacing_y - avail_h).max(0.0);
+                        sa = sa.vertical_scroll_offset(target.clamp(0.0, max_off));
+                    }
+                }
+            }
             sa.show_rows(ui, row_h, rows.len(), |ui, range| {
                     for i in range {
                         let (idx, disp) = &rows[i];
                         let is_current = cur_idx == Some(*idx);
                         let color = if is_current { th.playing_fg } else { th.fg };
-                        let mark = if is_current { "▶" } else { " " };
+                        let mark = if is_current { "▶ " } else { "  " };
                         let rich = RichText::new(format!("{} {:>3}  {}", mark, idx + 1, disp))
                             .color(color)
-                            .monospace();
+                            .monospace()
+                            .strong()
+                            .background_color(if is_current {
+                                th.playing_fg.linear_multiply(0.32)
+                            } else {
+                                Color32::TRANSPARENT
+                            });
                         let resp = ui.selectable_label(is_current, rich);
+                        if is_current {
+                            let hl = resp.rect.expand(1.0);
+                            ui.painter().rect_filled(hl, 2.0, th.playing_fg.linear_multiply(0.25));
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(hl.min, egui::vec2(3.0, hl.height())),
+                                1.0,
+                                th.playing_fg,
+                            );
+                        }
                         if resp.clicked() && self.drag_from.is_none() {
                             play_choice = Some(*idx);
                         }
@@ -6549,6 +6595,50 @@ fn window_icon_data() -> Option<egui::IconData> {
         return Some(data);
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn apply_taskbar_icon(cc: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateIconFromResourceEx, GetSystemMetrics, LR_DEFAULTCOLOR, SendMessageW, HICON, ICON_BIG,
+        ICON_SMALL, SM_CXICON, SM_CXSMICON, WM_SETICON,
+    };
+
+    fn make_hicon(source: &image::RgbaImage, size: i32) -> Option<HICON> {
+        let img = image::imageops::resize(source, size as u32, size as u32, image::imageops::Lanczos3);
+        let mut png = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        img.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+        let icon = unsafe {
+            CreateIconFromResourceEx(
+                png.as_ptr(),
+                png.len() as u32,
+                1,
+                0x0003_0000,
+                size,
+                size,
+                LR_DEFAULTCOLOR,
+            )
+        };
+        (!icon.is_null()).then_some(icon)
+    }
+
+    let Ok(handle) = cc.window_handle() else { return };
+    let RawWindowHandle::Win32(hw) = handle.as_raw() else { return };
+    let Some((rgba, w, h)) = app_icon_rgba(256) else { return };
+    let Some(source) = image::RgbaImage::from_raw(w, h, rgba) else { return };
+
+    let hwnd = hw.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+    // SAFETY: hwnd is a live window; WM_SETICON just installs the icon handle.
+    unsafe {
+        if let Some(icon) = make_hicon(&source, GetSystemMetrics(SM_CXICON)) {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as isize);
+        }
+        if let Some(icon) = make_hicon(&source, GetSystemMetrics(SM_CXSMICON)) {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
+        }
+    }
 }
 
 fn build_icon_fallback_rgba() -> Vec<u8> {
