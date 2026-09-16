@@ -7,10 +7,11 @@ A retro DOOM-styled media player for Windows, rendered in egui. Tape, CD, and Ra
 - **Deck modes**: switch the central deck between TAPE / CD / RADIO faces
   - **TAPE**: auto-reverse cassette with counters, winding, and tune slider
   - **CD**: spinning disc tray with track counter, LCDs, and in-order playback
-  - **RADIO**: FM/AM dial with click-and-drag tuning, presets, SCAN, and live web streams
+  - **RADIO**: FM/AM dial with click-and-drag tuning, presets, SCAN, live web streams, and an **ADD STATION** dialog to save your own FM/AM stream presets
 - **Bands catalog**: songs grouped by artist folder (A-Z, scrollable), rebuilt from whatever folder you add
 - **Play order switch**: flip the retro wall switch under BANDS. ON = random shuffle, OFF = normal in-order playback
 - **Smart shuffle**: weighted by your listening history, or plain shuffle
+- **Live visualizer**: a real-time 12-band spectrum with peak caps in the NOW panel, synced to whatever is playing (music or radio). The deck's bass woofers pump with the volume, rattle on heavy bass, shove downward on beats, and throw expanding shockwave rings
 - **Recording**: capture the current track or a live stream (REC on the deck)
 - **Video player**: click **Video** to play the matching movie in-app:
   - True fullscreen playback with letterboxing
@@ -55,6 +56,15 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 - The equalizer is currently **locked to FLAT** and shows a hover hint explaining why. It caused playback problems (videos stuck loading, bogus metadata) when enabled, so it has been disabled until the background EQ encode is reworked in a future build. Band changes / preset cycling / the ON-OFF toggle are disabled.
 - If you build from source and have `tools/ffmpeg.exe`, `tools/ffprobe.exe`, `tools/yt-dlp.exe` next to `Cargo.toml`, they are embedded into the exe by `build.rs` (that folder is gitignored). Without them the app falls back to downloading on first run.
+
+## v2.5.0 changelog
+
+- **Live audio visualizer**: the NOW panel now runs a real-time 12-band spectrum (about 30 Hz to 16 kHz) with peak caps, driven by the actual audio of whatever is playing, including the radio. The bars are loudness-relative, so they follow the music: gold/orange at steady volume, red flashes only on genuine peaks, and they fall away during quiet passages instead of staying pinned at full red.
+- **Punchy bass woofers**: the twin deck speakers analyze the audio and move with it. The cones pump in and out with volume, rattle when the bass kicks, shove downward on beats, and throw expanding shockwave rings; hard hits flash the speaker red.
+- **Radio ADD STATION**: a + ADD button in the radio deck opens a dialog to name a station, pick FM or AM, set the frequency, and paste the stream URL. It saves to your presets and starts playing immediately, so AM presets (or any custom stream) are fully usable.
+- **Radio dial now always lands**: dragging the dial sweeps and snaps to the nearest preset, and playback starts as soon as it settles. No more silent dead spots between stations.
+- **STOP now completely stops the radio**: the stream is cut and stays silent until you tune or play again (previously the radio could restart by itself about a second after stopping).
+- **Transport cleanup**: the standalone PAUSE deck key is gone. PLAY handles both start and pause, one obvious control.
 
 ## v2.4.0 changelog
 
