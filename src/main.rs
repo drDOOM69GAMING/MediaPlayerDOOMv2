@@ -16,18 +16,22 @@ use eframe::egui::{self, Color32, ColorImage, RichText, TextureHandle, TextureOp
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use rand::Rng;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use lofty::prelude::*;
 
 const APP_NAME: &str = "Random Shuffle Player";
-const APP_VERSION: &str = "2.4.0";
+const APP_VERSION: &str = "2.6.0";
 
 const AUDIO_FORMATS: [&str; 16] = [
     "mp3", "wav", "flac", "m4a", "m4b", "m4p", "ogg", "oga", "aac", "aiff", "aif", "wma", "wv", "mpc", "opus", "webm",
 ];
+
+const VIZ_BANDS: usize = 12;
+const VIZ_WIN: usize = 2048;
+const VIZ_HOP: usize = 1024;
 
 const THEME_NAMES: [&str; 5] = ["Winamp", "Matrix", "Cyberpunk", "Amber", "Ocean"];
 
@@ -377,25 +381,32 @@ fn grill_dots(painter: &egui::Painter, rect: egui::Rect, dot: Color32) {
     }
 }
 
-fn speaker_woofer(ui: &mut egui::Ui, d: f32, base: Color32, accent: Color32, pulse: f32) {
+fn speaker_woofer(ui: &mut egui::Ui, d: f32, base: Color32, accent: Color32, pulse: f32, kick: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::hover());
     let painter = ui.painter().with_clip_rect(ui.clip_rect());
-    let c = rect.center();
+    let c0 = rect.center();
+    let t = ui.input(|i| i.time) as f32;
+    let rattle = (pulse - 0.55).clamp(0.0, 1.0);
+    let dx = ((t * 97.0).sin() * 0.5 + (t * 61.0).cos() * 0.5) * rattle * 2.6;
+    let dy = pulse * pulse * 6.0;
+    let c = c0 + egui::vec2(dx, dy);
     let r = d * 0.5 - 3.0;
-    painter.circle_filled(c, r + 2.0, darken(base, 0.6));
-    painter.circle(c, r + 2.0, Color32::TRANSPARENT, egui::Stroke::new(1.5, darken(base, 0.75)));
-    painter.circle_filled(c, r, darken(base, 0.42));
-    painter.circle_filled(c, r * 0.88, darken(base, 0.30));
-    painter.circle(c, r * 0.88, Color32::TRANSPARENT, egui::Stroke::new(1.0, lighten(base, 0.08)));
-    painter.circle(c, r * 0.80, Color32::TRANSPARENT, egui::Stroke::new(1.0, darken(base, 0.5)));
-    let cone_r = r * 0.80;
-    let surge = 1.0 + pulse * 0.28;
-    let flex = cone_r * (1.06 + pulse * 0.20);
+    painter.circle_filled(c0, r + 2.0, darken(base, 0.6));
+    painter.circle(c0, r + 2.0, Color32::TRANSPARENT, egui::Stroke::new(1.5, darken(base, 0.75)));
+    painter.circle_filled(c0, r, darken(base, 0.42));
+    painter.circle_filled(c0, r * 0.88, darken(base, 0.30));
+    painter.circle(c0, r * 0.88, Color32::TRANSPARENT, egui::Stroke::new(1.0, lighten(base, 0.08)));
+    painter.circle(c0, r * 0.80, Color32::TRANSPARENT, egui::Stroke::new(1.0, darken(base, 0.5)));
+    let echo_r = r * (1.15 + (1.0 - kick) * 0.85);
+    painter.circle(c0, echo_r, Color32::TRANSPARENT, egui::Stroke::new(1.8, accent.linear_multiply(0.05 + kick * 0.55)));
+    let surge = 1.0 + pulse * 0.45;
+    let flex = r * 0.80 * (1.18 + pulse * 0.34);
     painter.circle(c, flex, Color32::TRANSPARENT, egui::Stroke::new(1.4, mix(base, Color32::BLACK, 0.55 - pulse * 0.35)));
     if pulse > 0.02 {
-        painter.circle_filled(c, r * 0.95, accent.linear_multiply(0.05 + pulse * 0.12));
+        painter.circle_filled(c, r * 0.95, accent.linear_multiply(0.05 + pulse * 0.22));
     }
-    painter.circle_filled(c, cone_r, darken(base, 0.14));
+    painter.circle_filled(c, r * 0.80, darken(base, 0.14));
+    let cone_r = r * 0.80;
     for i in 1..=6 {
         let k = i as f32 / 6.0;
         let rr = cone_r * k * surge;
@@ -408,13 +419,16 @@ fn speaker_woofer(ui: &mut egui::Ui, d: f32, base: Color32, accent: Color32, pul
         let p2 = c + egui::vec2(a.cos() * cone_r * 0.94 * surge, a.sin() * cone_r * 0.94 * surge);
         painter.line_segment([p1, p2], egui::Stroke::new(1.0, darken(base, 0.5)));
     }
-    painter.circle_filled(c, cone_r * 0.30 * surge, lighten(base, 0.12 + pulse * 0.22));
+    painter.circle_filled(c, cone_r * 0.30 * surge, lighten(base, 0.10 + pulse * 0.46));
     painter.circle(c, cone_r * 0.30 * surge, Color32::TRANSPARENT, egui::Stroke::new(1.0, darken(base, 0.5)));
+    if pulse > 0.85 {
+        painter.circle_filled(c, cone_r * 0.62, Color32::from_rgba_unmultiplied(255, 60, 60, (pulse * 90.0) as u8));
+    }
     let glow = mix(accent, Color32::WHITE, 0.3);
     painter.line_segment(
         [
-            c + egui::vec2(-r * 0.55, -r * 0.45),
-            c + egui::vec2(-r * 0.15, -r * 0.62),
+            c0 + egui::vec2(-r * 0.55, -r * 0.45),
+            c0 + egui::vec2(-r * 0.15, -r * 0.62),
         ],
         egui::Stroke::new(1.5, glow.linear_multiply(0.25)),
     );
@@ -671,6 +685,10 @@ struct Settings {
     video_positions: HashMap<String, f32>,
     #[serde(default)]
     intro_skip_enabled: bool,
+    #[serde(default)]
+    video_cut_cache: HashMap<String, String>,
+    #[serde(skip)]
+    video_cut_inflight: HashSet<String>,
     #[serde(default = "default_intro_skip")]
     intro_skip_secs: f32,
     #[serde(default = "default_credits_skip")]
@@ -827,7 +845,7 @@ fn gc_eq_files(current: u64) {
             let name = e.file_name().to_string_lossy().into_owned();
             if let Some(rest) = name.strip_prefix("mpoofdoom_eq_") {
                 if let Some(rest) = rest.strip_suffix(".wav") {
-                    if let Ok(n) = rest.parse::<u64>() {
+if let Ok(n) = rest.parse::<u64>() {
                         if n + 2 < current {
                             let _ = std::fs::remove_file(e.path());
                         }
@@ -841,6 +859,7 @@ fn gc_eq_files(current: u64) {
 enum Msg {
     Error(String),
     DirScanned { dir: String, files: Vec<String> },
+    ScanProgress { found: usize },
     PlaylistSaved,
     PlaylistLoaded { files: Vec<String> },
     Added { files: Vec<String> },
@@ -848,7 +867,7 @@ enum Msg {
     Meta { path: String, title: String, artist: String, album: String, duration: Duration },
     ArtLocal { bytes: Option<Vec<u8>> },
     ArtWeb { bytes: Option<Vec<u8>> },
-    Lyrics { text: Option<String> },
+    Lyrics { artist: String, title: String, text: Option<String> },
     EqReady(u64),
     EqFailed(u64),
     YtStatus(String),
@@ -859,11 +878,12 @@ enum Msg {
     TranscodeFail { display: String, err: String },
     Recorded { display: String, path: String },
     RecordFail { display: String, err: String },
-    VideoFrame { w: u32, h: u32, rgba: Vec<u8> },
+    VideoFrame { w: u32, h: u32, rgba: Vec<u8>, gen: u64 },
     VideoClosed { gen: u64 },
     VideoPos { gen: u64, secs: f32 },
     VideoMeta { gen: u64, dur: f32 },
     VideoBounds { gen: u64, path: String, intro_end: f32, credits_start: f32 },
+    VideoCutDone { gen: u64, path: String, cut: Option<String>, err: Option<String> },
 }
 
 enum LibCmd {
@@ -882,6 +902,7 @@ enum LibCmd {
     VideoClose,
     VideoPause(bool),
     VideoAnalyze { path: String, gen: u64 },
+    VideoCut { path: String, gen: u64, intro_end: f32, credits_start: f32 },
 }
 
 enum NetCmd {
@@ -905,6 +926,28 @@ fn collect_audio(dir: &str) -> Vec<String> {
     let mut out = Vec::new();
     walk(Path::new(dir), &mut out);
     out.sort();
+    out
+}
+
+fn collect_audio_report(dir: &str, tx: &Sender<Msg>) -> Vec<String> {
+    fn walk(d: &Path, out: &mut Vec<String>, last: &mut std::time::Instant, tx: &Sender<Msg>) {
+        let rd = match std::fs::read_dir(d) { Ok(rd) => rd, Err(_) => return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out, last, tx);
+            } else if is_audio(&p.to_string_lossy()) {
+                out.push(p.to_string_lossy().to_string());
+            }
+            if last.elapsed().as_millis() >= 300 {
+                let _ = tx.send(Msg::ScanProgress { found: out.len() });
+                *last = std::time::Instant::now();
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut last = std::time::Instant::now();
+    walk(Path::new(dir), &mut out, &mut last, tx);
     out
 }
 
@@ -967,6 +1010,216 @@ fn record_flight_ffmpeg(url: &str, ffmpeg: &Path, dest: &Path, secs: u32) -> Res
         Ok(dest.to_path_buf())
     } else {
         Err("ffmpeg could not record this stream".into())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VizState {
+    bars: [f32; VIZ_BANDS],
+    rms: f32,
+    onset: f32,
+}
+
+impl Default for VizState {
+    fn default() -> Self {
+        VizState { bars: [0.0; VIZ_BANDS], rms: 0.0, onset: 0.0 }
+    }
+}
+
+fn viz_fft(re: &mut [f32], im: &mut [f32]) {
+    let n = re.len();
+    if !n.is_power_of_two() {
+        return;
+    }
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while (j & bit) != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2usize;
+    while len <= n {
+        let ang = -2.0 * std::f32::consts::PI / len as f32;
+        let (wlen_r, wlen_i) = (ang.cos(), ang.sin());
+        let half = len >> 1;
+        let mut i = 0usize;
+        while i < n {
+            let (mut wr, mut wi) = (1.0f32, 0.0f32);
+            for k in 0..half {
+                let er = re[i + k + half];
+                let ei = im[i + k + half];
+                let tr = er * wr - ei * wi;
+                let ti = er * wi + ei * wr;
+                re[i + k + half] = re[i + k] - tr;
+                im[i + k + half] = im[i + k] - ti;
+                re[i + k] += tr;
+                im[i + k] += ti;
+                let nwr = wr * wlen_r - wi * wlen_i;
+                wi = wr * wlen_i + wi * wlen_r;
+                wr = nwr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+struct VizTap<S> {
+    inner: S,
+    out: std::sync::Arc<std::sync::Mutex<VizState>>,
+    ch: u16,
+    edges: [f32; VIZ_BANDS + 1],
+    ring: Vec<f32>,
+    pos: usize,
+    frame_pos: u16,
+    since: usize,
+    fft_re: Vec<f32>,
+    fft_im: Vec<f32>,
+    acc_rms: f32,
+    acc_cnt: usize,
+    prev_rms: f32,
+    smooth_rms: f32,
+    bar_typ: [f32; VIZ_BANDS],
+    rms_peak: f32,
+}
+
+impl<S: rodio::Source> VizTap<S>
+where
+    S::Item: rodio::Sample,
+{
+    fn new(inner: S, out: std::sync::Arc<std::sync::Mutex<VizState>>) -> Self {
+        let mut edges = [0.0f32; VIZ_BANDS + 1];
+        for i in 0..=VIZ_BANDS {
+            edges[i] = 30.0f32 * (16000.0f32 / 30.0f32).powf(i as f32 / VIZ_BANDS as f32);
+        }
+        let ch = inner.channels().max(1);
+        VizTap {
+            inner,
+            out,
+            ch,
+            edges,
+            ring: vec![0.0; VIZ_WIN],
+            pos: 0,
+            frame_pos: 0,
+            since: 0,
+            fft_re: vec![0.0; VIZ_WIN],
+            fft_im: vec![0.0; VIZ_WIN],
+            acc_rms: 0.0,
+            acc_cnt: 0,
+            prev_rms: 0.0,
+            smooth_rms: 0.0,
+            bar_typ: [0.0001; VIZ_BANDS],
+            rms_peak: 0.02,
+        }
+    }
+
+    fn analyze(&mut self) {
+        let n = self.ring.len();
+        for i in 0..n {
+            let idx = (self.pos + i) % n;
+            let h = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n - 1) as f32).cos();
+            self.fft_re[i] = self.ring[idx] * h;
+            self.fft_im[i] = 0.0;
+        }
+        viz_fft(&mut self.fft_re, &mut self.fft_im);
+        let sr = self.inner.sample_rate().max(1) as f32;
+        let fbin = sr / n as f32;
+        let mut bars = [0.0f32; VIZ_BANDS];
+        const RATE: f32 = 43.0;
+        let ka = 1.0 - (-1.0 / (2.2 * RATE)).exp();
+        let kd = 1.0 - (-1.0 / (4.5 * RATE)).exp();
+        for b in 0..VIZ_BANDS {
+            let k0 = ((self.edges[b] / fbin).ceil() as usize).max(1);
+            let k1 = ((self.edges[b + 1] / fbin).floor() as usize).min(n / 2 - 1);
+            let mut power = 0.0f64;
+            for k in k0..=k1 {
+                let re = self.fft_re[k] as f64;
+                let im = self.fft_im[k] as f64;
+                power += re * re + im * im;
+            }
+            let db = 10.0 * ((power / (k1 - k0 + 1).max(1) as f64) + 1e-12).log10();
+            let src = ((db as f32 + 35.0) / 75.0).clamp(0.0, 1.0);
+            let typ = self.bar_typ[b];
+            let k = if src > typ { ka } else { kd };
+            self.bar_typ[b] = typ + (src - typ) * k;
+            bars[b] = (src / (1.5 * self.bar_typ[b].max(0.0001))).clamp(0.0, 1.0);
+        }
+        let rms_win = ((self.acc_rms / self.acc_cnt.max(1) as f32).sqrt() * 4.0).min(1.0);
+        let peak = self.rms_peak.max(rms_win * 0.995);
+        self.rms_peak = peak.max(0.02);
+        let rms_n = (rms_win / self.rms_peak.max(0.02)).clamp(0.0, 1.0);
+        self.smooth_rms = self.smooth_rms * 0.75 + rms_n * 0.25;
+        let onset = (self.smooth_rms - self.prev_rms).abs();
+        self.prev_rms = self.smooth_rms;
+        if let Ok(mut st) = self.out.lock() {
+            st.bars = bars;
+            st.rms = rms_n;
+            st.onset = onset.clamp(0.0, 1.0);
+        }
+        self.acc_rms = 0.0;
+        self.acc_cnt = 0;
+        self.since = 0;
+    }
+}
+
+impl<S: rodio::Source> Iterator for VizTap<S>
+where
+    S::Item: rodio::Sample,
+    f32: cpal::FromSample<S::Item>,
+{
+    type Item = S::Item;
+    fn next(&mut self) -> Option<Self::Item> {
+        let v = self.inner.next()?;
+        if self.frame_pos == 0 {
+            let f = <f32 as cpal::Sample>::from_sample(v);
+            self.ring[self.pos] = f;
+            self.pos = (self.pos + 1) % self.ring.len();
+            self.acc_rms += f * f;
+            self.acc_cnt += 1;
+            self.since += 1;
+            if self.since >= VIZ_HOP {
+                self.analyze();
+            }
+        }
+        self.frame_pos = (self.frame_pos + 1) % self.ch;
+        Some(v)
+    }
+}
+
+impl<S: rodio::Source> rodio::Source for VizTap<S>
+where
+    S::Item: rodio::Sample,
+    f32: cpal::FromSample<S::Item>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+    fn try_seek(&mut self, pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+        let r = self.inner.try_seek(pos);
+        if r.is_ok() {
+            self.ring.fill(0.0);
+            self.pos = 0;
+            self.since = 0;
+            self.acc_rms = 0.0;
+            self.acc_cnt = 0;
+        }
+        r
     }
 }
 
@@ -1282,22 +1535,29 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
 
 fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::sync::atomic::AtomicBool>, video_child: &mut Option<Child>, video_thread: &mut Option<std::thread::JoinHandle<()>>) {
         match cmd {
-            LibCmd::Scan(dir) => {
-                let files = collect_audio(&dir);
+LibCmd::Scan(dir) => {
+                let tx2 = tx.clone();
+                let files = collect_audio_report(&dir, &tx2);
                 let _ = tx.send(Msg::DirScanned { dir, files });
             }
             LibCmd::AddMany(entries) => {
+                let tx2 = tx.clone();
                 let mut added: Vec<String> = Vec::new();
                 for e in entries {
                     let p = PathBuf::from(&e);
                     if p.is_dir() {
-                        let sub = collect_audio(&e);
+                        let sub = collect_audio_report(&e, &tx2);
                         for f in sub {
-                            if !added.contains(&f) { added.push(f); }
+                            if !added.contains(&f) {
+                                added.push(f);
+                            }
                         }
                     } else if is_audio(&e) {
-                        if !added.contains(&e) { added.push(e); }
+                        if !added.contains(&e) {
+                            added.push(e);
+                        }
                     }
+                    let _ = tx2.send(Msg::ScanProgress { found: added.len() });
                 }
                 added.sort();
                 let _ = tx.send(Msg::Added { files: added });
@@ -1405,6 +1665,7 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                     let h = th;
                     let pausef = std::sync::Arc::clone(video_pause);
                     let tx2 = tx.clone();
+                    let gen2 = gen;
                     let pos_send = (fps as u64).max(1);
                     *video_thread = Some(std::thread::spawn(move || {
                         use std::io::Read;
@@ -1415,6 +1676,7 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                         let frame_t = std::time::Duration::from_secs_f64(1.0 / fps as f64);
                         let mut next_t = std::time::Instant::now();
                         let mut was_paused = false;
+                        let mut pacing_locked = false;
                         let mut frames: u64 = 0;
                         loop {
                             let paused = pausef.load(std::sync::atomic::Ordering::Relaxed);
@@ -1439,17 +1701,22 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                             for p in buf.chunks_exact(3) {
                                 rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
                             }
-                            if tx2.send(Msg::VideoFrame { w, h, rgba }).is_err() {
+                            if tx2.send(Msg::VideoFrame { w, h, rgba, gen: gen2 }).is_err() {
                                 break;
                             }
                             frames += 1;
+                            if !pacing_locked {
+                                next_t = std::time::Instant::now();
+                                pacing_locked = true;
+                            } else {
+                                next_t += frame_t;
+                            }
                             if frames % pos_send == 0 {
                                 let secs = seek + frames as f32 / fps;
                                 if tx2.send(Msg::VideoPos { gen, secs }).is_err() {
                                     break;
                                 }
                             }
-                            next_t += frame_t;
                         }
                         let _ = tx2.send(Msg::VideoClosed { gen });
                     }));
@@ -1493,6 +1760,16 @@ fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::s
                         credits = 0.0;
                     }
                     let _ = tx2.send(Msg::VideoBounds { gen, path, intro_end: intro, credits_start: credits });
+                });
+            }
+            LibCmd::VideoCut { path, gen, intro_end, credits_start } => {
+                let tx2 = tx.clone();
+                std::thread::spawn(move || {
+                    let cut = cut_video_file(&path, intro_end, credits_start);
+                    match cut {
+                        Ok(c) => { let _ = tx2.send(Msg::VideoCutDone { gen, path, cut: Some(c), err: None }); }
+                        Err(e) => { let _ = tx2.send(Msg::VideoCutDone { gen, path, cut: None, err: Some(e) }); }
+                    }
                 });
             }
         }
@@ -1727,7 +2004,7 @@ fn net_loop(rx: Receiver<NetCmd>, tx: Sender<Msg>) {
                 }
                 NetCmd::Lyrics(artist, title) => {
                     let text = fetch_lyrics(&artist, &title);
-                    let _ = tx.send(Msg::Lyrics { text });
+                    let _ = tx.send(Msg::Lyrics { artist, title, text });
                 }
                 NetCmd::YtDownload(query) => {
                     let r = yt_download_and_store(&query, &tx);
@@ -1806,6 +2083,10 @@ fn ytdlp_path() -> PathBuf {
 
 fn ffmpeg_path() -> PathBuf {
     tools_dir().join("ffmpeg.exe")
+}
+
+fn mkvmerge_path() -> PathBuf {
+    tools_dir().join("mkvmerge.exe")
 }
 
 fn music_folder() -> PathBuf {
@@ -1902,6 +2183,13 @@ fn ensure_tools(tx: &Sender<Msg>) -> Result<(), String> {
             }
         }
     }
+    let mm = mkvmerge_path();
+    if !mm.is_file() {
+        match EMBEDDED_MKVMERGE {
+            Some(b) => write_bin(&mm, b, "mkvmerge")?,
+            None => { /* mkvmerge is optional; cut feature unavailable */ }
+        }
+    }
     Ok(())
 }
 
@@ -1931,10 +2219,69 @@ fn next_track_num(dir: &Path) -> u32 {
     max + 1
 }
 
-fn yt_lookup(yt: &Path, target: &str) -> Result<(String, String, String, String), String> {
+fn cut_video_file(source: &str, intro_end: f32, credits_start: f32) -> Result<String, String> {
+    let mm = mkvmerge_path();
+    if !mm.is_file() {
+        return Err("mkvmerge.exe not available".into());
+    }
+    let src = Path::new(source);
+    let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+    let parent = std::env::temp_dir().join("mediaplayerofdoom_cuts");
+    if let Err(e) = std::fs::create_dir_all(&parent) {
+        return Err(format!("cannot create temp cut dir: {}", e));
+    }
+    for stale in std::fs::read_dir(&parent).ok().into_iter().flatten().flatten() {
+        let _ = std::fs::remove_file(stale.path());
+    }
+    let cut_path = parent.join(format!("{}_cut.mkv", stem));
+    let mut args: Vec<String> = Vec::new();
+    args.push("--no-date".into());
+    args.push("--no-track-tags".into());
+    args.push("-o".into());
+    args.push(cut_path.to_string_lossy().to_string());
+    args.push("--split".into());
+    let ie = intro_end.max(0.0) as u64;
+    let cs = credits_start.max(0.0) as u64;
+    let fmt_ts = |s: u64| format!("{:02}:{:02}:{:02}.000", s / 3600, (s % 3600) / 60, s % 60);
+    let spec = if ie > 0 && (cs > 0 && cs > ie) {
+        format!("parts:{}-{}", fmt_ts(ie), fmt_ts(cs))
+    } else if ie > 0 {
+        format!("parts:{}-", fmt_ts(ie))
+    } else if cs > 0 {
+        format!("parts:-{}", fmt_ts(cs))
+    } else {
+        return Err("no cut range".into());
+    };
+    args.push(spec);
+    args.push(source.to_string());
+    let out = std::process::Command::new(mm)
+        .creation_flags(NO_WINDOW)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("mkvmerge failed to start: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("mkvmerge failed: {}", stderr.chars().take(200).collect::<String>()));
+    }
+    if !cut_path.is_file() {
+        let pattern = format!("{}_cut-*.mkv", stem);
+        if let Some(found) = parent.read_dir().ok().and_then(|rd| {
+            rd.flatten().find(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with(&format!("{}_cut", stem)) && n.ends_with(".mkv")
+            })
+        }) {
+            return Ok(found.path().to_string_lossy().to_string());
+        }
+        return Err("mkvmerge finished but cut file not found".into());
+    }
+    Ok(cut_path.to_string_lossy().to_string())
+}
+
+fn yt_lookup(yt: &Path, target: &str) -> Result<(String, String, String, String, String), String> {
     let out = std::process::Command::new(yt)
         .creation_flags(NO_WINDOW)
-        .args(["--skip-download", "--no-warnings", "--newline", "--print", "%(id)s|%(title)s|%(artist)s|%(uploader)s", target])
+        .args(["--skip-download", "--no-warnings", "--newline", "--print", "%(id)s|%(title)s|%(artist)s|%(uploader)s|%(album)s", target])
         .output()
         .map_err(|e| format!("yt-dlp failed to start: {}", e))?;
     let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string();
@@ -1943,6 +2290,7 @@ fn yt_lookup(yt: &Path, target: &str) -> Result<(String, String, String, String)
     }
     let mut it = first.split('|');
     Ok((
+        it.next().unwrap_or("").to_string(),
         it.next().unwrap_or("").to_string(),
         it.next().unwrap_or("").to_string(),
         it.next().unwrap_or("").to_string(),
@@ -2015,17 +2363,19 @@ fn yt_download_and_store(query: &str, tx: &Sender<Msg>) -> Result<PathBuf, Strin
         return Err("Enter a YouTube URL or search term".into());
     }
     let target = if q.starts_with("http") { q.to_string() } else { format!("ytsearch1:{}", q) };
-    let (id, title, artist, uploader) = yt_lookup(&ytdlp_path(), &target)?;
+    let (id, title, artist, uploader, album) = yt_lookup(&ytdlp_path(), &target)?;
     let mut display = title.clone();
     if display.is_empty() {
         display = id.clone();
     }
     let _ = tx.send(Msg::YtStatus(format!("Downloading \"{}\"...", display)));
     let mp3 = yt_grab(&ytdlp_path(), &ffmpeg_path(), &target, &id, tx)?;
-    let folder = music_folder();
-    let num = next_track_num(&folder);
     let artist = if artist.is_empty() { uploader } else { artist };
     let artist = if artist.is_empty() { "Unknown".to_string() } else { artist };
+    let album_d = if album.is_empty() { "Singles".to_string() } else { album };
+    let folder = music_folder().join(format!("{} - {}", sanitize_win(&artist), sanitize_win(&album_d)));
+    let _ = std::fs::create_dir_all(&folder);
+    let num = next_track_num(&folder);
     let mut fname = format!("{:03} - {} ({}).mp3", num, sanitize_win(&title), sanitize_win(&artist));
     let mut final_path = folder.join(&fname);
     let mut extra = 0u32;
@@ -2078,6 +2428,9 @@ struct PlayerApp {
     len_secs: f32,
     dragging: bool,
     running: String,
+    scanning: bool,
+    scan_found: usize,
+    scan_tick: std::time::Instant,
     fullscreen: bool,
     fs_asserted: bool,
     video_fs_restore_app: bool,
@@ -2110,6 +2463,10 @@ struct PlayerApp {
     lyrics_title: String,
     viz_bars: Vec<f32>,
     viz_peaks: Vec<f32>,
+    viz_lock: std::sync::Arc<std::sync::Mutex<VizState>>,
+    viz_rms: f32,
+    viz_rms_prev: f32,
+    viz_pop: f32,
     want_web: bool,
     last_drop: Vec<PathBuf>,
     drag_from: Option<usize>,
@@ -2131,6 +2488,11 @@ struct PlayerApp {
     radio_proc: Option<Child>,
     radio_last_moved: f64,
     radio_last_start: Instant,
+    show_add_radio: bool,
+    add_name: String,
+    add_band: String,
+    add_freq: String,
+    add_url: String,
     disc_in: bool,
     disc_label: String,
     last_cd_dir: Option<String>,
@@ -2171,6 +2533,8 @@ struct PlayerApp {
     video_bounds: HashMap<String, (f32, f32)>,
     show_bounds: HashMap<String, (f32, f32)>,
     analyzing_video: HashSet<String>,
+    video_cut_cache: HashMap<String, String>,
+    video_cut_inflight: HashSet<String>,
     random_on: bool,
     switch_accum: f32,
 }
@@ -2293,6 +2657,9 @@ impl PlayerApp {
             len_secs: 0.0,
             dragging: false,
             running: String::new(),
+            scanning: true,
+            scan_found: 0,
+            scan_tick: std::time::Instant::now(),
             fullscreen: true,
             fs_asserted: false,
             video_fs_restore_app: false,
@@ -2319,6 +2686,11 @@ impl PlayerApp {
             radio_proc: None,
             radio_last_moved: 0.0,
             radio_last_start: Instant::now(),
+            show_add_radio: false,
+            add_name: String::new(),
+            add_band: "FM".to_string(),
+            add_freq: String::new(),
+            add_url: String::new(),
             disc_in: false,
             disc_label: String::new(),
             last_cd_dir,
@@ -2356,6 +2728,8 @@ video_ended: false,
             intro_skip_secs: 90.0,
             credits_skip_secs: 90.0,
             video_bounds: HashMap::new(),
+            video_cut_cache: HashMap::new(),
+            video_cut_inflight: HashSet::new(),
             show_bounds: HashMap::new(),
             analyzing_video: HashSet::new(),
             random_on: true,
@@ -2379,6 +2753,10 @@ video_ended: false,
             lyrics_title: String::new(),
             viz_bars: vec![2.0; 12],
             viz_peaks: vec![0.0; 12],
+            viz_lock: std::sync::Arc::new(std::sync::Mutex::new(VizState::default())),
+            viz_rms: 0.0,
+            viz_rms_prev: 0.0,
+            viz_pop: 0.0,
             want_web: false,
             last_drop: Vec::new(),
             drag_from: None,
@@ -2409,6 +2787,8 @@ video_ended: false,
             credits_skip_secs: self.credits_skip_secs,
             video_bounds: self.video_bounds.clone(),
             show_bounds: self.show_bounds.clone(),
+            video_cut_cache: self.video_cut_cache.clone(),
+            video_cut_inflight: self.video_cut_inflight.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&s) {
             let _ = std::fs::write(&self.settings_path, text);
@@ -2499,6 +2879,7 @@ video_ended: false,
             match m {
                 Msg::Error(s) => self.set_error(s),
                 Msg::DirScanned { dir, files } => {
+                    self.scanning = false;
                     self.state.current_dir = Some(dir.clone());
                     self.ingest_dir(&dir, &files);
                     self.state.playlist = files;
@@ -2528,6 +2909,7 @@ video_ended: false,
                     self.save_settings();
                 }
                 Msg::Added { files } => {
+                    self.scanning = false;
                     self.ingest_bands(&files, None);
                     let mut n = 0;
                     for f in files {
@@ -2541,11 +2923,17 @@ video_ended: false,
                     self.set_status(format!("Added {} files", n));
                     self.save_settings();
                 }
+                Msg::ScanProgress { found } => {
+                    self.scanning = true;
+                    self.scan_found = found;
+                    self.scan_tick = std::time::Instant::now();
+                }
                 Msg::FolderFound { folder } => {
                     if let Some(f) = folder {
                         self.set_status(format!("Auto-loaded: {}", f));
                         let _ = self.lib_tx.send(LibCmd::Scan(f));
                     } else {
+                        self.scanning = false;
                         self.set_status("No Music folder found — use ADD DIR to pick one");
                     }
                 }
@@ -2574,10 +2962,10 @@ video_ended: false,
                         }
                     }
                 }
-                Msg::Lyrics { text } => {
+                Msg::Lyrics { artist, title, text } => {
                     if let Some(t) = text {
                         self.lyrics = Some(t);
-                        self.lyrics_title = format!("{} - {}", self.meta.1, self.meta.0);
+                        self.lyrics_title = format!("{} - {}", artist, title);
                     } else {
                         self.set_error("Lyrics not found");
                     }
@@ -2693,15 +3081,17 @@ video_ended: false,
                     self.recording = false;
                     self.set_error(format!("{}: {}", stem(&display), err));
                 }
-                Msg::VideoFrame { w, h, rgba } => {
-                    self.video_dims = (w, h);
-                    let size = [w as usize, h as usize];
-                    let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
-                    self.video_tex = Some(self.ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
-                    if self.video_audio_pending && !self.video_paused {
-                        self.video_audio_pending = false;
-                        if let Some(s) = &self.video_sink {
-                            s.play();
+                Msg::VideoFrame { w, h, rgba, gen } => {
+                    if gen == self.video_gen {
+                        self.video_dims = (w, h);
+                        let size = [w as usize, h as usize];
+                        let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                        self.video_tex = Some(self.ctx.load_texture("video", img, egui::TextureOptions::LINEAR));
+                        if self.video_audio_pending && !self.video_paused {
+                            self.video_audio_pending = false;
+                            if let Some(s) = &self.video_sink {
+                                s.play();
+                            }
                         }
                     }
                 }
@@ -2763,6 +3153,31 @@ video_ended: false,
                                 }
                             }
                             self.save_settings();
+                            if self.intro_skip_enabled && !path.ends_with("_cut.mkv") && !self.video_cut_inflight.contains(&path) {
+                                let (i2, c2) = self.video_bounds.get(&path).copied().unwrap_or((0.0, 0.0));
+                                if i2 > 2.0 && c2 > 2.0 && mkvmerge_path().is_file() && !self.video_cut_cache.contains_key(&path) {
+                                    self.video_cut_inflight.insert(path.clone());
+                                    let _ = self.lib_tx.send(LibCmd::VideoCut { path: path.clone(), gen, intro_end: i2, credits_start: c2 });
+                                }
+                            }
+                        }
+                    }
+                }
+                Msg::VideoCutDone { gen, path, cut, err } => {
+                    if gen == self.video_gen {
+                        self.video_cut_inflight.remove(&path);
+                        if let Some(cp) = cut {
+                            self.video_cut_cache.insert(path.clone(), cp.clone());
+                            if let Some(&(ie, cs)) = self.video_bounds.get(&path) {
+                                self.video_bounds.insert(cp.clone(), (ie, cs));
+                            }
+                            self.save_settings();
+                            if self.video_current.as_deref() == Some(path.as_str()) {
+                                self.set_status(format!("Auto-cut done → playing {}", stem(&cp)));
+                                self.play_video_item(cp);
+                            }
+                        } else if let Some(e) = err {
+                            self.set_status(format!("Auto-cut failed: {}; using seek skip", e));
                         }
                     }
                 }
@@ -2861,6 +3276,14 @@ video_ended: false,
         });
     }
 
+    fn tap_viz<S: rodio::Source>(&self, src: S) -> VizTap<S>
+    where
+        S::Item: rodio::Sample,
+        f32: cpal::FromSample<S::Item>,
+    {
+        VizTap::new(src, self.viz_lock.clone())
+    }
+
     fn play_decoded(&mut self, display: &str, src: Decoder<BufReader<File>>, forward_track: bool) {
         self.set_winding(None);
         if self.radio_on {
@@ -2872,7 +3295,11 @@ video_ended: false,
         }
         self.sink.stop();
         self.sink.set_volume(self.state.volume as f32 / 100.0);
-        self.sink.append(src);
+        let dur = src.total_duration().unwrap_or_default().as_secs_f32();
+        if self.len_secs <= 0.0 && dur > 0.0 {
+            self.len_secs = dur;
+        }
+        self.sink.append(self.tap_viz(src));
         self.sink.play();
         self.state.current_song = Some(display.to_string());
         self.state.prev_songs.push(display.to_string());
@@ -2918,7 +3345,7 @@ video_ended: false,
         let pos = self.pos.max(0.0);
         self.sink.stop();
         self.sink.set_volume(self.state.volume as f32 / 100.0);
-        self.sink.append(src);
+        self.sink.append(self.tap_viz(src));
         self.sink.play();
         self.state.is_paused = false;
         self.play_started = Some(Instant::now());
@@ -3023,18 +3450,51 @@ video_ended: false,
     }
 
     fn toggle_pause(&mut self) {
-        if self.sink.empty() && self.state.current_song.is_none() {
+        self.play_press();
+    }
+
+    fn play_press(&mut self) {
+        if self.radio_on {
+            if self.state.is_paused {
+                self.unpause_music();
+            } else {
+                self.pause_music();
+            }
             return;
         }
-        if self.state.is_paused {
-            self.state.is_paused = false;
-            self.sink.play();
-            self.set_status("Playing");
-        } else {
-            self.state.is_paused = true;
-            self.sink.pause();
-            self.set_status("Paused");
+        let loaded = self.state.current_song.is_some();
+        let active = self.play_started.is_some() && !self.sink.empty();
+        if loaded && active {
+            if self.state.is_paused {
+                self.unpause_music();
+            } else {
+                self.pause_music();
+            }
+            return;
         }
+        if self.state.current_song.is_none() {
+            if let Some((path, pos)) = self.deck_resume.take() {
+                if Path::new(&path).is_file() {
+                    self.resume_tape(&path, pos);
+                    return;
+                }
+            }
+        }
+        if let Some(cur) = self.state.current_song.clone() {
+            if Path::new(&cur).is_file() {
+                self.resume_tape(&cur, self.pos.max(0.0));
+                return;
+            }
+        }
+        if !self.state.playlist.is_empty() {
+            let pl = self.state.playlist.clone();
+            let idx = self.playing_pl_idx.filter(|i| *i < pl.len()).unwrap_or(0);
+            self.playing_pl_idx = Some(idx);
+            let song = pl[idx].clone();
+            self.play_song(&song);
+            return;
+        }
+        self.set_status("Nothing to play - add music first");
     }
 
     fn pause_music(&mut self) {
@@ -3129,14 +3589,17 @@ video_ended: false,
     }
 
     fn radio_tuned_at(&self) -> Option<usize> {
-        let tol = if self.radio_band == "AM" { 25.0 } else { 0.3 };
+        let (lo, hi) = self.radio_band_range();
         let mut best: Option<(usize, f32)> = None;
         for (i, s) in self.radio_presets.iter().enumerate() {
             if !s.band.eq_ignore_ascii_case(&self.radio_band) {
                 continue;
             }
+            if s.freq < lo || s.freq > hi {
+                continue;
+            }
             let d = (s.freq - self.radio_freq).abs();
-            if d <= tol && best.map_or(true, |(_, bd)| d < bd) {
+            if best.map_or(true, |(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -3161,7 +3624,7 @@ video_ended: false,
         self.radio_loading = true;
         match spawn_radio_stream(&st.url, &ffmpeg_path()) {
             Ok((proc, src)) => {
-                self.sink.append(src);
+                self.sink.append(self.tap_viz(src));
                 self.sink.play();
                 self.state.is_paused = false;
                 self.radio_proc = Some(proc);
@@ -3191,6 +3654,8 @@ video_ended: false,
         self.radio_on = false;
         self.radio_playing_idx = None;
         self.radio_loading = false;
+        self.radio_last_moved = 0.0;
+        self.radio_tuned = None;
         self.sink.stop();
         self.play_started = None;
         self.state.is_paused = false;
@@ -3203,14 +3668,15 @@ video_ended: false,
     }
 
     fn tick_radio(&mut self, now: f64) {
-        if !self.show_radio && !self.radio_on {
+        let ever_tuned = self.radio_last_moved > 0.0;
+        if !ever_tuned && !self.radio_on {
             return;
         }
         let target = self.radio_tuned_at();
         self.radio_tuned = target;
         if now - self.radio_last_moved > 0.7 {
             if let Some(t) = target {
-                if self.radio_playing_idx != Some(t) {
+                if self.radio_playing_idx != Some(t) || (self.radio_playing_idx.is_none() && !self.radio_on) {
                     self.start_radio(t);
                 }
             }
@@ -3218,7 +3684,12 @@ video_ended: false,
         if self.radio_on && !self.radio_loading {
             if self.sink.empty() && self.play_started.is_none() {
                 if let Some(idx) = self.radio_playing_idx {
-                    if self.radio_last_start.elapsed() > Duration::from_millis(2000) {
+                    let patience = if self.play_started.is_none() {
+                        Duration::from_millis(12000)
+                    } else {
+                        Duration::from_millis(2500)
+                    };
+                    if self.radio_last_start.elapsed() > patience {
                         self.radio_proc = None;
                         self.start_radio(idx);
                     }
@@ -3563,7 +4034,7 @@ video_ended: false,
     }
 
     fn seek_to(&self, secs: f32) {
-        if self.state.current_song.is_none() || self.state.is_paused {
+        if self.state.current_song.is_none() {
             return;
         }
         let _ = self.sink.try_seek(Duration::from_secs_f32(secs.max(0.0)));
@@ -3575,9 +4046,7 @@ video_ended: false,
         }
         let np = (self.pos + d).clamp(0.0, self.len_secs);
         self.pos = np;
-        if !self.state.is_paused {
-            let _ = self.sink.try_seek(Duration::from_secs_f32(np));
-        }
+        let _ = self.sink.try_seek(Duration::from_secs_f32(np));
     }
 
     fn skip_forward(&mut self) {
@@ -3848,7 +4317,11 @@ video_ended: false,
                 self.pos = self.sink.get_pos().as_secs_f32();
             }
         }
-        if self.state.start_time.is_some() {
+        if self.scanning {
+            let d = self.scan_tick.elapsed().as_millis() / 300 % 3;
+            let dots = ".".repeat(d as usize + 1);
+            self.running = format!("SCANNING{}  {} songs found", dots, self.scan_found);
+        } else if self.state.start_time.is_some() {
             let d = self.state.start_time.as_ref().map(|t| t.elapsed()).unwrap_or_default();
             self.running = format!("Songs: {} | Skips: {} | {}", self.state.song_count, self.state.skip_count, fmt_run(d));
         }
@@ -4052,30 +4525,39 @@ video_ended: false,
     }
 
     fn update_viz(&mut self, dt: f32) {
-        let t = self.ctx.input(|i| i.time) as f32;
         let vh = 76.0;
-        for i in 0..self.viz_bars.len() {
-            let x = i as f32;
-            let mut h = 0.0;
-            h += (t * 1.7 + x * 0.83).sin().abs() * 0.30;
-            h += (t * 3.4 + x * 1.37).sin().abs() * 0.24;
-            h += (t * 5.9 + x * 2.21).sin().abs() * 0.18;
-            let bass = if x < 4.0 { (t * 2.05 + x * 0.3).sin().abs() * 0.22 } else { 0.0 };
-            let mut target = (h + bass + 0.08) * vh * 1.25;
-            if target < 3.0 {
-                target = 3.0;
+        let (bars, rms, onset) = match self.viz_lock.lock() {
+            Ok(st) => (st.bars, st.rms, st.onset),
+            Err(p) => {
+                let st = p.into_inner();
+                (st.bars, st.rms, st.onset)
             }
+        };
+        let active = !self.state.is_paused && (self.state.current_song.is_some() || self.radio_on);
+        for i in 0..self.viz_bars.len() {
+            let target = if active { (bars[i] * vh).max(2.0) } else { 2.0 };
             let cur = self.viz_bars[i];
-            let k = if target > cur { 1.0 - (-dt * 16.0).exp() } else { 1.0 - (-dt * 5.5).exp() };
+            let k = if target > cur {
+                1.0 - (-dt * 45.0).exp()
+            } else {
+                1.0 - (-dt * (8.0 + onset * 50.0)).exp()
+            };
             let next = cur + (target - cur) * k;
             self.viz_bars[i] = next.max(2.0).min(vh);
             let peak = self.viz_peaks[i];
             if next > peak {
                 self.viz_peaks[i] = next;
             } else {
-                self.viz_peaks[i] = (peak - dt * 9.0).max(0.0);
+                let fall = if active { 6.0 + onset * 40.0 } else { 4.0 };
+                self.viz_peaks[i] = (peak - dt * fall).max(0.0);
             }
         }
+        let dr = if active { (rms - self.viz_rms_prev).clamp(-1.0, 1.0) } else { 0.0 };
+        self.viz_rms_prev = rms;
+        let kick = if active { (dr * 3.0).max(0.0).min(1.0) } else { 0.0 };
+        self.viz_pop = kick.max(self.viz_pop * (1.0 - (-dt * 14.0).exp()));
+        let tr = if active { rms } else { 0.0 };
+        self.viz_rms += (tr - self.viz_rms) * (1.0 - (-dt * 15.0).exp());
     }
 
     fn draw_title_bar(&mut self, ui: &mut egui::Ui) {
@@ -4236,13 +4718,14 @@ video_ended: false,
             }
             grill_dots(&painter, vr, Color32::from_rgba_unmultiplied(0, 0, 0, 40));
             ui.add_space(4.0);
-            let playing_now = self.state.current_song.is_some() && !self.state.is_paused;
-            let bass = self.viz_bars[0].max(self.viz_bars[1]);
-            let pulse = if playing_now { ((bass - 8.0) / 68.0).clamp(0.0, 1.0).powf(1.2) } else { 0.0 };
+            let playing_now = !self.state.is_paused && (self.state.current_song.is_some() || self.radio_on);
+            let en = if playing_now { ((self.viz_rms - 0.10).max(0.0) / 0.90).clamp(0.0, 1.0) } else { 0.0 };
+            let kick = if playing_now { self.viz_pop } else { 0.0 };
+            let pulse = (en + kick * 0.6).clamp(0.0, 1.0);
             ui.horizontal(|ui| {
-                speaker_woofer(ui, 76.0, th.btn_bg, th.accent, pulse);
+                speaker_woofer(ui, 76.0, th.btn_bg, th.accent, pulse, self.viz_pop);
                 ui.add_space(10.0);
-                speaker_woofer(ui, 76.0, th.btn_bg, th.accent, pulse);
+                speaker_woofer(ui, 76.0, th.btn_bg, th.accent, pulse, self.viz_pop);
             });
             ui.add_space(6.0);
             ui.separator();
@@ -4533,6 +5016,12 @@ video_ended: false,
                                 }
                             });
                             ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("PRESETS").color(darken(th.accent, 0.35)).monospace().size(9.0));
+                                if retro_btn(ui, "+ ADD", th.playing_fg, th.btn_bg).clicked() {
+                                    self.show_add_radio = true;
+                                }
+                            });
                             ui.horizontal_wrapped(|ui| {
                                 let rows: Vec<(usize, f32, String)> = self
                                     .radio_presets
@@ -4649,7 +5138,7 @@ video_ended: false,
                     self.wind_arm = Some((-1.0, wn));
                 }
                 if deck_key(ui, "PLAY", Color32::from_rgb(255, 235, 235), mix(th.btn_bg, red, 0.45)).clicked() {
-                    if self.state.is_paused { self.unpause_music(); } else { self.pause_music(); }
+                    self.play_press();
                 }
                 let fwd = deck_key(ui, "FWD", th.btn_fg, th.btn_bg);
                 if fwd.drag_started() {
@@ -4686,9 +5175,6 @@ video_ended: false,
                         self.stop_radio();
                     }
                 }
-                if deck_key(ui, "PAUSE", th.btn_fg, th.btn_bg).clicked() {
-                    self.pause_music();
-                }
                 let rec_lbl = if self.recording && (ui.input(|i| i.time) * 2.0).fract() < 0.5 {
                     "● REC"
                 } else {
@@ -4721,8 +5207,19 @@ video_ended: false,
                     ui.horizontal(|ui| {
                         if retro_btn(ui, "Change Dir", th.playing_fg, th.btn_bg).clicked() {
                             if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                self.scanning = true;
                                 self.set_status("Scanning library...");
                                 let _ = self.lib_tx.send(LibCmd::Scan(dir.to_string_lossy().to_string()));
+                            }
+                        }
+                        if retro_btn(ui, "Refresh", th.btn_fg, th.btn_bg).clicked() {
+                            self.scanning = true;
+                            if let Some(d) = self.state.current_dir.clone() {
+                                self.set_status("Scanning library...");
+                                let _ = self.lib_tx.send(LibCmd::Scan(d));
+                            } else {
+                                self.set_status("Locating music folder...");
+                                let _ = self.lib_tx.send(LibCmd::FindMusicFolder);
                             }
                         }
                     });
@@ -5143,7 +5640,6 @@ video_ended: false,
                 ui.label(RichText::new("DECK CONTROLS (TAPE MODE)").color(acc).monospace().strong());
                 ui.label(RichText::new("PLAY ................ Start / Pause playback").color(dim).monospace());
                 ui.label(RichText::new("STOP ................ Stop playback").color(dim).monospace());
-                ui.label(RichText::new("PAUSE ............... Pause playback").color(dim).monospace());
                 ui.label(RichText::new("REW ................. Press & hold to rewind").color(dim).monospace());
                 ui.label(RichText::new("FWD ................. Press & hold to fast-forward").color(dim).monospace());
                 ui.label(RichText::new("SKIP ................ Next track").color(dim).monospace());
@@ -5161,8 +5657,9 @@ video_ended: false,
                 ui.label(RichText::new("FM / AM ............. Switch band").color(dim).monospace());
                 ui.label(RichText::new("TUNE- / TUNE+ ........ Step frequency").color(dim).monospace());
                 ui.label(RichText::new("SCAN ................ Auto-scan for stations").color(dim).monospace());
+                ui.label(RichText::new("+ ADD ............... Add a station (name / band / freq / URL)").color(dim).monospace());
                 ui.label(RichText::new("Click dial .......... Tune to frequency").color(dim).monospace());
-                ui.label(RichText::new("Drag dial ........... Sweep frequencies").color(dim).monospace());
+                ui.label(RichText::new("Drag dial ........... Sweep, auto-locks nearest station").color(dim).monospace());
                 ui.add_space(6.0);
 
                 ui.label(RichText::new("TUNE SLIDER").color(acc).monospace().strong());
@@ -5191,21 +5688,98 @@ video_ended: false,
             });
     }
 
+    fn show_add_radio_window(&mut self, ctx: &egui::Context) {
+        let th = self.theme_colors();
+        let mut open = self.show_add_radio;
+        egui::Window::new("ADD STATION")
+            .resizable(false)
+            .collapsible(false)
+            .default_width(400.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("NAME:").color(th.fg).monospace().size(11.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.add_name).desired_width(240.0).font(egui::TextStyle::Monospace).text_color(th.playing_fg));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("BAND:").color(th.fg).monospace().size(11.0));
+                    if retro_btn(ui, "FM", if self.add_band == "FM" { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() {
+                        self.add_band = "FM".to_string();
+                    }
+                    if retro_btn(ui, "AM", if self.add_band == "AM" { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() {
+                        self.add_band = "AM".to_string();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("FREQ:").color(th.fg).monospace().size(11.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.add_freq).hint_text(if self.add_band == "AM" { "e.g. 1120" } else { "e.g. 98.5" }).desired_width(140.0).font(egui::TextStyle::Monospace).text_color(th.playing_fg));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("URL:").color(th.fg).monospace().size(11.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.add_url).hint_text("https:// or http:// audio stream").desired_width(300.0).font(egui::TextStyle::Monospace).text_color(th.playing_fg));
+                });
+                ui.add_space(6.0);
+                let (lo, hi) = if self.add_band == "AM" { (530.0, 1700.0) } else { (87.9, 107.9) };
+                ui.label(RichText::new(format!("{} RANGE: {} - {}", self.add_band, lo, hi)).color(Color32::from_gray(110)).monospace().size(9.0));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if retro_btn(ui, "SAVE", th.playing_fg, th.btn_bg).clicked() {
+                        let name = self.add_name.trim().to_string();
+                        let url = self.add_url.trim().to_string();
+                        let freq = self.add_freq.trim().parse::<f32>();
+                        if !name.is_empty() && !url.is_empty() {
+                            if let Ok(f) = freq {
+                                if f >= lo && f <= hi {
+                                    let band = self.add_band.clone();
+                                    self.radio_presets.push(RadioStation { name: name.clone(), band: band.clone(), freq: f, url: url.clone() });
+                                    save_radio(&self.radio_presets);
+                                    let idx = self.radio_presets.len() - 1;
+                                    self.radio_band = band;
+                                    self.radio_freq = f;
+                                    self.radio_last_moved = ui.input(|i| i.time);
+                                    self.start_radio(idx);
+                                    self.add_name.clear();
+                                    self.add_freq.clear();
+                                    self.add_url.clear();
+                                    self.show_add_radio = false;
+                                    self.set_status(format!("Station added: {} @ {}", name, fmt_freq(f)));
+                                } else {
+                                    self.set_error(format!("Frequency must be in {} range {} - {}", self.add_band, lo, hi));
+                                }
+                            } else {
+                                self.set_error("Frequency must be a number");
+                            }
+                        } else {
+                            self.set_error("Station needs a name and an audio stream URL");
+                        }
+                    }
+                    if retro_btn(ui, "CANCEL", th.btn_fg, th.btn_bg).clicked() {
+                        self.show_add_radio = false;
+                    }
+                });
+            });
+        self.show_add_radio = open;
+    }
+
     fn ui_lyrics(&mut self) {
         let ctx = self.ctx.clone();
+        let max_h: f32 = (ctx.viewport_rect().height() * 0.7).clamp(120.0, 900.0);
         egui::Window::new(format!("Lyrics - {}", self.lyrics_title))
-            .resizable(true)
             .collapsible(false)
             .default_size([520.0, 440.0])
             .show(&ctx, |ui| {
+                let th = self.theme_colors();
+                ui.horizontal(|ui| {
+                    if retro_btn(ui, "CLOSE", Color32::from_rgb(0, 255, 0), th.btn_bg).clicked() {
+                        self.lyrics = None;
+                    }
+                    ui.label(RichText::new(&self.lyrics_title).color(th.accent).monospace().size(12.0));
+                });
+                ui.add_space(4.0);
                 if let Some(lyr) = self.lyrics.clone() {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                         ui.label(RichText::new(lyr).color(Color32::from_rgb(0x39, 0xFF, 0x14)).monospace());
                     });
-                }
-                let th = self.theme_colors();
-                if retro_btn(ui, "CLOSE", Color32::from_rgb(0, 255, 0), th.btn_bg).clicked() {
-                    self.lyrics = None;
                 }
             });
     }
@@ -5336,6 +5910,16 @@ video_ended: false,
         self.video_cur_secs = 0.0;
         self.video_seek_t = None;
         self.video_current = Some(path.clone());
+        if !path.ends_with("_cut.mkv") {
+            let cut_dir = std::env::temp_dir().join("mediaplayerofdoom_cuts");
+            if let Ok(rd) = std::fs::read_dir(&cut_dir) {
+                for e in rd.flatten() {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+            self.video_cut_cache.clear();
+            self.video_cut_inflight.clear();
+        }
         self.attach_video_audio(&path, saved_pos);
         self.video_cur_secs = saved_pos;
         self.set_status(format!("MOVIE {}/{}: {}", self.video_queue_idx + 1, self.video_queue.len(), stem(&path)));
@@ -5429,11 +6013,10 @@ video_ended: false,
         (intro, credits)
     }
 
-    fn maybe_analyze_video(&mut self, path: &str) {
+        fn maybe_analyze_video(&mut self, path: &str) {
         if !self.intro_skip_enabled {
             return;
-        }
-        let known = self
+        }        let known = self
             .video_bounds
             .get(path)
             .map(|b| b.0 > 2.0 || b.1 > 2.0)
@@ -5445,6 +6028,24 @@ video_ended: false,
         let gen = self.video_gen;
         let _ = self.lib_tx.send(LibCmd::VideoAnalyze { path: path.to_string(), gen });
         self.set_status(format!("ANALYZE intro/credits: {}", stem(path)));
+    }
+
+    fn try_cut_current_video(&self, path: String) {
+        if !self.intro_skip_enabled || self.intro_skip_secs > 2.0 && false {
+            return;
+        }
+        if path.ends_with("_cut.mkv") || self.video_cut_inflight.contains(&path) || self.video_cut_cache.contains_key(&path) {
+            return;
+        }
+        let (ie, cs) = self.video_bounds.get(&path).copied().unwrap_or((0.0, 0.0));
+        if ie < 2.0 || cs < 2.0 {
+            return;
+        }
+        if !mkvmerge_path().is_file() {
+            return;
+        }
+        let gen = self.video_gen;
+        let _ = self.lib_tx.send(LibCmd::VideoCut { path, gen, intro_end: ie, credits_start: cs });
     }
 
     fn start_video(&mut self, path: String) {
@@ -5533,7 +6134,7 @@ video_ended: false,
                 (m.y <= scr.min.y + 34.0 && m.x >= scr.min.x && m.x <= scr.max.x) || queue_region.contains(m)
             });
             self.video_bar_visible = hovering;
-            let mut close = false;
+            let mut fs_off = false;
             let mut togg = false;
             let mut next = false;
             let mut prev = false;
@@ -5561,27 +6162,27 @@ video_ended: false,
                     if self.video_bar_visible {
                         let bar = egui::Rect::from_min_size(scr.min, egui::vec2(sw, 30.0));
                         ui.painter().rect_filled(bar, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(8.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new("CLOSE")).clicked() {
-                            close = true;
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(8.0, 4.0), egui::vec2(76.0, 22.0)), egui::Button::new("EXIT FS")).clicked() {
+                            fs_off = true;
                         }
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(104.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(if self.video_paused { "PLAY" } else { "PAUSE" })).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(92.0, 4.0), egui::vec2(80.0, 22.0)), egui::Button::new(if self.video_paused { "PLAY" } else { "PAUSE" })).clicked() {
                             togg = true;
                         }
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(200.0, 4.0), egui::vec2(56.0, 22.0)), egui::Button::new("<<")).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(180.0, 4.0), egui::vec2(52.0, 22.0)), egui::Button::new("<<")).clicked() {
                             prev = true;
                         }
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(264.0, 4.0), egui::vec2(56.0, 22.0)), egui::Button::new(">>")).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(240.0, 4.0), egui::vec2(52.0, 22.0)), egui::Button::new(">>")).clicked() {
                             next = true;
                         }
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(352.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new("+ ADD")).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(300.0, 4.0), egui::vec2(80.0, 22.0)), egui::Button::new("+ ADD")).clicked() {
                             add = true;
                         }
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(448.0, 4.0), egui::vec2(150.0, 22.0)), egui::Button::new(format!("ASPECT {}", self.video_aspect.label()))).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(388.0, 4.0), egui::vec2(150.0, 22.0)), egui::Button::new(format!("ASPECT {}", self.video_aspect.label()))).clicked() {
                             aspect_cycle = true;
                         }
                         let skip_lbl = if self.intro_skip_enabled { "SKIP: ON" } else { "SKIP: OFF" };
                         let skip_color = if self.intro_skip_enabled { Color32::from_rgb(100, 255, 100) } else { Color32::from_gray(160) };
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(606.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(egui::RichText::new(skip_lbl).color(skip_color))).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(546.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(egui::RichText::new(skip_lbl).color(skip_color))).clicked() {
                             self.intro_skip_enabled = !self.intro_skip_enabled;
                             self.save_settings();
                             if self.intro_skip_enabled {
@@ -5597,7 +6198,7 @@ video_ended: false,
                         } else {
                             "INTRO --".to_string()
                         };
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(700.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(bnd_lbl)).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(640.0, 4.0), egui::vec2(88.0, 22.0)), egui::Button::new(bnd_lbl)).clicked() {
                             if let Some(p) = self.video_current.clone() {
                                 let (_, ccs) = self.video_bounds.get(&p).copied().unwrap_or((0.0, bcs));
                                 self.video_bounds.insert(p.clone(), (self.video_cur_secs, ccs));
@@ -5606,7 +6207,8 @@ video_ended: false,
                                     self.show_bounds.insert(dir, (self.video_cur_secs, pc));
                                 }
                                 self.save_settings();
-                                self.set_status(format!("Intro END set at {}", fmt_time(self.video_cur_secs)));
+                                self.set_status(format!("Intro END set at {} (preset)", fmt_time(self.video_cur_secs)));
+                                self.try_cut_current_video(p);
                             }
                         }
                         let crd_lbl = if bcs > 0.0 {
@@ -5614,7 +6216,7 @@ video_ended: false,
                         } else {
                             "CREDS --".to_string()
                         };
-                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(794.0, 4.0), egui::vec2(86.0, 22.0)), egui::Button::new(crd_lbl)).clicked() {
+                        if ui.put(egui::Rect::from_min_size(scr.min + egui::vec2(734.0, 4.0), egui::vec2(86.0, 22.0)), egui::Button::new(crd_lbl)).clicked() {
                             if let Some(p) = self.video_current.clone() {
                                 let (iie, _) = self.video_bounds.get(&p).copied().unwrap_or((0.0, 0.0));
                                 self.video_bounds.insert(p.clone(), (iie, self.video_cur_secs));
@@ -5623,7 +6225,7 @@ video_ended: false,
                                     self.show_bounds.insert(dir, (pi, self.video_cur_secs));
                                 }
                                 self.save_settings();
-                                self.set_status(format!("Credits START set at {}", fmt_time(self.video_cur_secs)));
+                                self.set_status(format!("Credits START set at {} (preset)", fmt_time(self.video_cur_secs)));
                             }
                         }
                         let mut vv = self.video_volume;
@@ -5731,6 +6333,7 @@ video_ended: false,
                         togg = true;
                     }
                 });
+            if fs_off { self.set_video_fs(false); }
             if let Some(i) = play_idx { self.play_queue_idx(i); }
             if let Some(i) = del_idx { self.remove_queue_item(i); }
             if clearq { self.video_queue.clear(); self.video_queue_idx = 0; }
@@ -5756,9 +6359,6 @@ video_ended: false,
             if next { self.queue_next(); }
             if togg {
                 self.toggle_video_play();
-            }
-            if close {
-                self.close_video();
             }
             self.video_hide_cursor(ctx, t_now);
             return;
@@ -5853,6 +6453,11 @@ impl eframe::App for PlayerApp {
         self.stop_radio();
         self.save_settings();
         self.save_history();
+        if let Ok(rd) = std::fs::read_dir(std::env::temp_dir().join("mediaplayerofdoom_cuts")) {
+            for e in rd.flatten() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -5888,6 +6493,9 @@ impl eframe::App for PlayerApp {
 
         if self.show_help {
             self.show_help_window(&ctx);
+        }
+        if self.show_add_radio {
+            self.show_add_radio_window(&ctx);
         }
         if self.show_radio {
             self.show_radio_window(&ctx);
@@ -5927,7 +6535,55 @@ fn make_tray() -> Result<TrayIcon, Box<dyn std::error::Error + Send + Sync>> {
     Ok(tray)
 }
 
+fn app_icon_rgba(size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let bits = include_bytes!("../assets/app_icon.jpg");
+    let img = image::load_from_memory(bits).ok()?;
+    let img = img.thumbnail(size, size);
+    let rgba = img.to_rgba8().into_raw();
+    Some((rgba, size, size))
+}
+
+fn window_icon_data() -> Option<egui::IconData> {
+    if let Some((rgba, w, h)) = app_icon_rgba(64) {
+        let data = egui::IconData { rgba, width: w, height: h };
+        return Some(data);
+    }
+    None
+}
+
+fn build_icon_fallback_rgba() -> Vec<u8> {
+    let mut rgba: Vec<u8> = vec![0; 32 * 32 * 4];
+    let t1 = (9.0, 13.0);
+    let t2 = (9.0, 25.0);
+    let t3 = (24.0, 19.0);
+    for y in 0..32 {
+        for x in 0..32 {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - 16.0;
+            let dy = py - 16.0;
+            let d = (dx * dx + dy * dy).sqrt();
+            let i = ((y * 32 + x) * 4) as usize;
+            if point_in_tri(px, py, t1, t2, t3) && d <= 14.5 {
+                rgba[i] = 0; rgba[i + 1] = 255; rgba[i + 2] = 0; rgba[i + 3] = 255;
+            } else if d <= 15.0 {
+                rgba[i] = 42; rgba[i + 1] = 42; rgba[i + 2] = 42; rgba[i + 3] = 255;
+            } else if d <= 16.5 {
+                rgba[i] = 0; rgba[i + 1] = 170; rgba[i + 2] = 0; rgba[i + 3] = 255;
+            } else {
+                rgba[i] = 0; rgba[i + 1] = 0; rgba[i + 2] = 0; rgba[i + 3] = 0;
+            }
+        }
+    }
+    rgba
+}
+
 fn build_icon() -> Icon {
+    if let Some((rgba, w, h)) = app_icon_rgba(32) {
+        if let Ok(i) = Icon::from_rgba(rgba, w, h) {
+            return i;
+        }
+    }
     let mut rgba: Vec<u8> = vec![0; 32 * 32 * 4];
     let p1 = (9.0, 13.0);
     let p2 = (9.0, 25.0);
@@ -6129,6 +6785,11 @@ std::panic::set_hook(Box::new(|info| {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
+            .with_icon(window_icon_data().unwrap_or_else(|| egui::IconData {
+                rgba: build_icon_fallback_rgba(),
+                width: 32,
+                height: 32,
+            }))
             .with_title(format!("{} v{}", APP_NAME, APP_VERSION)),
         ..Default::default()
     };

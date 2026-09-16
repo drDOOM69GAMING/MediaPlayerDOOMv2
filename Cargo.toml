@@ -1,11 +1,12 @@
 [package]
 name = "mediaplayerofdoom"
-version = "0.1.0"
+version = "2.6.0"
 edition = "2021"
 
 [dependencies]
 eframe = "0.36"
 rodio = { version = "0.19", features = ["symphonia-all"] }
+cpal = "0.15"
 lofty = "0.22"
 symphonia = "0.5"
 hound = "3"

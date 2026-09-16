@@ -8,6 +8,7 @@ fn main() {
         ("ffmpeg.exe", "EMBEDDED_FFMPEG"),
         ("ffprobe.exe", "EMBEDDED_FFPROBE"),
         ("yt-dlp.exe", "EMBEDDED_YTDLP"),
+        ("mkvmerge.exe", "EMBEDDED_MKVMERGE"),
     ] {
         let p = tools.join(name);
         println!("cargo:rerun-if-changed={}", p.display());
