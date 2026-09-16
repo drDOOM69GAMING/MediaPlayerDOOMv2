@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = "0.36"
 rodio = { version = "0.19", features = ["symphonia-all"] }
+cpal = "0.15"
 lofty = "0.22"
 symphonia = "0.5"
 hound = "3"
