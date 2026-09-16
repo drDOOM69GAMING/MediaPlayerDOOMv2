@@ -1,6 +1,6 @@
 [package]
 name = "mediaplayerofdoom"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,13 @@ rfd = "0.14"
 tray-icon = "0.24"
 global-hotkey = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [build-dependencies]
 embed-resource = "2"
