@@ -63,25 +63,25 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 This app is built on the work of some incredible open-source projects, and it wouldn't exist without them:
 
-- **FFmpeg / FFprobe** (GPL v3) — audio/video decoding, transcoding, metadata, and analysis. <https://ffmpeg.org/> · <https://www.gyan.dev/ffmpeg/builds/>
-- **yt-dlp** (Unlicense) — YouTube downloads. <https://github.com/yt-dlp/yt-dlp>
-- **MKVToolNix / mkvmerge** (GPL v2) — real lossless video cuts at INTRO/CREDS markers. <https://mkvtoolnix.download/>
-- **egui / eframe** (MIT/Apache-2.0) — the immediate-mode GUI toolkit that renders the whole DOOM-styled interface. <https://github.com/emilk/egui>
-- **rodio / cpal** (MIT/Apache-2.0, Apache-2.0) — audio playback and device access.
-- **symphonia** (MPL-2.0) — pure-Rust media demuxing/decoding.
+- **FFmpeg / FFprobe** (GPL v3) - audio/video decoding, transcoding, metadata, and analysis. <https://ffmpeg.org/> - <https://www.gyan.dev/ffmpeg/builds/>
+- **yt-dlp** (Unlicense) - YouTube downloads. <https://github.com/yt-dlp/yt-dlp>
+- **MKVToolNix / mkvmerge** (GPL v2) - real lossless video cuts at INTRO/CREDS markers. <https://mkvtoolnix.download/>
+- **egui / eframe** (MIT/Apache-2.0) - the immediate-mode GUI toolkit that renders the whole DOOM-styled interface. <https://github.com/emilk/egui>
+- **rodio / cpal** (MIT/Apache-2.0, Apache-2.0) - audio playback and device access.
+- **symphonia** (MPL-2.0) - pure-Rust media demuxing/decoding.
 - The **Rust** language and its crate ecosystem.
 
-Full details, license texts, and donation links are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). If you can, consider donating to FFmpeg, yt-dlp, and MKVToolNix — they give this all away for free.
+Full details, license texts, and donation links are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). If you can, consider donating to FFmpeg, yt-dlp, and MKVToolNix - they give this all away for free.
 
 ## v2.8.0 changelog
 
-- **Real-time in-app equalizer** (replaces the old offline process-and-swap EQ that had to be disabled): a 10-band EQ (60 Hz–16 kHz) processes the audio live in the playback chain, so band changes, presets, and the ON/OFF toggle apply instantly mid-song with zero interruption.
-- **EQ curve panel**: a 20 Hz–20 kHz response graph shows the combined EQ curve with band markers and current values, plus the **AUTO** preamp percentage.
+- **Real-time in-app equalizer** (replaces the old offline process-and-swap EQ that had to be disabled): a 10-band EQ (60 Hz-16 kHz) processes the audio live in the playback chain, so band changes, presets, and the ON/OFF toggle apply instantly mid-song with zero interruption.
+- **EQ curve panel**: a 20 Hz-20 kHz response graph shows the combined EQ curve with band markers and current values, plus the **AUTO** preamp percentage.
 - **Presets**: `◀ EQ` / `EQ ▶` cycle through preset curves (Bass Boost, Rock, Pop, etc.), the same style of graphic-equalizer presets the AQUA system EQ uses.
-- **10 vertical band sliders** (−12 to +12 dB) with per-band labels; touch any slider and it becomes your **Custom** curve.
+- **10 vertical band sliders** (-12 to +12 dB) with per-band labels; touch any slider and it becomes your **Custom** curve.
 - **EQ settings are saved**: EQ on/off, the active preset, and your custom curve reload with the app.
 - **Works everywhere**: the EQ applies to music, the tape, radio streams, and video audio alike.
-- **EQ auto-preamp**: because boosting bands can clip, the app measures the boosted response (20 Hz–20 kHz sweep) and scales it down so the loudest part sits right at full scale — loud, clean, no distortion.
+- **EQ auto-preamp**: because boosting bands can clip, the app measures the boosted response (20 Hz-20 kHz sweep) and scales it down so the loudest part sits right at full scale - loud, clean, no distortion.
 
 ## v2.7.0 changelog
 
@@ -107,13 +107,13 @@ Full details, license texts, and donation links are in [THIRD-PARTY-NOTICES.md](
 ## v2.4.0 changelog
 
 - **Original aspect ratio (ORIG)**: the video decode now preserves each file's true aspect ratio instead of stretching everything to 16:9, so 4:3 shows and the ORIG aspect button matches the source.
-- **Audio/video sync**: video frames are paced at the file's real framerate (not a fixed 24fps), and playback audio waits until the first frame is on screen — voices and picture stay in sync.
+- **Audio/video sync**: video frames are paced at the file's real framerate (not a fixed 24fps), and playback audio waits until the first frame is on screen - voices and picture stay in sync.
 - **Cursor auto-hide**: in fullscreen the mouse cursor hides after 5 seconds of no movement and reappears as soon as you move it again.
-- **Automatic intro/credits detection**: videos with **SKIP: ON** are analyzed on play — the app measures the audio front/back, finds where the intro ends and credits/outro begins, then auto-skips the intro and hops to the next video when credits roll.
+- **Automatic intro/credits detection**: videos with **SKIP: ON** are analyzed on play - the app measures the audio front/back, finds where the intro ends and credits/outro begins, then auto-skips the intro and hops to the next video when credits roll.
 - **Manual INTRO / CREDS markers** in the video top bar: click during playback to mark intro-end or credits-start at the current position for that file/folder; persisted in settings.
-- **Queue stays open while you use it**: the bar and queue show whenever the mouse is over the top strip or the queue panel, and hide the moment it leaves — so you can scroll, play rows, and hit CLEAR without them vanishing mid-use. The old SHOW QUEUE pin toggle is removed.
+- **Queue stays open while you use it**: the bar and queue show whenever the mouse is over the top strip or the queue panel, and hide the moment it leaves - so you can scroll, play rows, and hit CLEAR without them vanishing mid-use. The old SHOW QUEUE pin toggle is removed.
 - **Per-file + per-folder skip memory**: detected and manual bound times are stored both for the exact file and for its folder, so the whole series skips consistently.
-- **Auto-hide controls**: the fullscreen video top bar and queue appear only while the mouse is over the top strip or the queue panel, and disappear when the mouse leaves — nothing stays stuck on screen.
+- **Auto-hide controls**: the fullscreen video top bar and queue appear only while the mouse is over the top strip or the queue panel, and disappear when the mouse leaves - nothing stays stuck on screen.
 
 ## v2.3.0 changelog
 

@@ -2,7 +2,7 @@
 
 MediaPlayerDOOM **v2.8.0** is original software released under the MIT License (see `LICENSE`). The MIT license covers only the code written by the project author(s).
 
-This application bundles and relies on several third-party components, each of which remains the property of its respective authors and is used under its own license. We are grateful to every project below — this program would not exist without them. **A huge thank you to all of their developers and contributors.**
+This application bundles and relies on several third-party components, each of which remains the property of its respective authors and is used under its own license. We are grateful to every project below - this program would not exist without them. **A huge thank you to all of their developers and contributors.**
 
 ## Embedded command-line tools
 
@@ -14,7 +14,7 @@ The release exe embeds the following programs and self-extracts them to `%LOCALA
 - **Version embedded:** 9.0.1 (essentials build for Windows by `www.gyan.dev`)
 - **License:** GPL v3 (this particular build is compiled with `--enable-gpl` and `--enable-version3`)
 - **Copyright:** Copyright (c) 2000-2026 the FFmpeg developers
-- **Source:** <https://ffmpeg.org/> — source code available at <https://ffmpeg.org/download.html>
+- **Source:** <https://ffmpeg.org/> - source code available at <https://ffmpeg.org/download.html>
 - **Binary/source distribution used:** <https://www.gyan.dev/ffmpeg/builds/>
 
 Thank you to the entire FFmpeg team and the gyan.dev build maintainers for making the world's most capable media toolkit free for everyone.
@@ -25,7 +25,7 @@ Thank you to the entire FFmpeg team and the gyan.dev build maintainers for makin
 
 - **Used for:** YouTube downloads (audio/video) from paste-in URLs or search terms.
 - **Version embedded:** 2026.08.19
-- **License:** The Unlicense (public domain) — see <https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE>
+- **License:** The Unlicense (public domain) - see <https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE>
 - **Project:** <https://github.com/yt-dlp/yt-dlp>
 
 Thank you to the yt-dlp team for maintaining the best open-source YouTube downloader.
@@ -34,8 +34,8 @@ Thank you to the yt-dlp team for maintaining the best open-source YouTube downlo
 
 - **Used for:** cutting video at INTRO/CREDS markers to produce real, lossless cut files.
 - **Version embedded:** v101.0
-- **License:** GNU GPL v2 (with the typical "or later" grant) — see <https://gitlab.com/mbunkus/mkvtoolnix>
-- **Project:** <https://mkvtoolnix.download/> · <https://gitlab.com/mbunkus/mkvtoolnix>
+- **License:** GNU GPL v2 (with the typical "or later" grant) - see <https://gitlab.com/mbunkus/mkvtoolnix>
+- **Project:** <https://mkvtoolnix.download/> - <https://gitlab.com/mbunkus/mkvtoolnix>
 
 Thank you to Moritz Bunkus and the MKVToolNix contributors for the gold standard of Matroska tooling.
 
