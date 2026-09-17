@@ -23,7 +23,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use lofty::prelude::*;
 
 const APP_NAME: &str = "Random Shuffle Player";
-const APP_VERSION: &str = "2.6.0";
+const APP_VERSION: &str = "2.8.0";
 
 const AUDIO_FORMATS: [&str; 16] = [
     "mp3", "wav", "flac", "m4a", "m4b", "m4p", "ogg", "oga", "aac", "aiff", "aif", "wma", "wv", "mpc", "opus", "webm",
@@ -695,6 +695,12 @@ struct Settings {
     video_bounds: HashMap<String, (f32, f32)>,
     #[serde(default)]
     show_bounds: HashMap<String, (f32, f32)>,
+    #[serde(default)]
+    eq_on: bool,
+    #[serde(default)]
+    eq_preset: String,
+    #[serde(default)]
+    eq_custom: Option<[f32; 10]>,
 }
 
 fn default_video_volume() -> u32 {
@@ -797,60 +803,18 @@ impl Default for PlayerState {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Biquad {
     b0: f64, b1: f64, b2: f64, a1: f64, a2: f64,
     x1: f64, x2: f64, y1: f64, y2: f64,
 }
 
 impl Biquad {
-    fn fresh(&self) -> Biquad {
-        Biquad { b0: self.b0, b1: self.b1, b2: self.b2, a1: self.a1, a2: self.a2, x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
-    }
-    fn bandpass_q(f0: f64, q: f64, fs: f64) -> Biquad {
-        // RBJ cookbook peaking-Q band-pass, unity peak gain
-        let w0 = 2.0 * std::f64::consts::PI * f0 / fs;
-        let c = w0.cos();
-        let s = w0.sin();
-        let alpha = s / (2.0 * q);
-        let b0 = alpha;
-        let b1 = 0.0;
-        let b2 = -alpha;
-        let a0 = 1.0 + alpha;
-        let a1 = -2.0 * c;
-        let a2 = 1.0 - alpha;
-        Biquad { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
-    }
     fn process(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1 - self.a2 * self.y2;
         self.x2 = self.x1; self.x1 = x;
         self.y2 = self.y1; self.y1 = y;
         y
-    }
-}
-
-fn filter_signal(x: &[f64], coeffs: &Biquad) -> Vec<f64> {
-    let mut f = coeffs.fresh();
-    x.iter().map(|&v| f.process(v)).collect()
-}
-
-fn eq_out_path(rid: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("mpoofdoom_eq_{}.wav", rid))
-}
-
-fn gc_eq_files(current: u64) {
-    if let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(rest) = name.strip_prefix("mpoofdoom_eq_") {
-                if let Some(rest) = rest.strip_suffix(".wav") {
-if let Ok(n) = rest.parse::<u64>() {
-                        if n + 2 < current {
-                            let _ = std::fs::remove_file(e.path());
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -866,12 +830,11 @@ enum Msg {
     ArtLocal { bytes: Option<Vec<u8>> },
     ArtWeb { bytes: Option<Vec<u8>> },
     Lyrics { artist: String, title: String, text: Option<String> },
-    EqReady(u64),
-    EqFailed(u64),
     YtStatus(String),
     YtLog(String),
-    YtDone { path: PathBuf },
-    YtFail(String),
+    YtDone { path: PathBuf, auto_play: bool },
+    YtFail { err: String, auto_play: bool },
+    YtResolved { idx: usize, query: String, display: String },
     Transcoded { display: String, wav: PathBuf },
     TranscodeFail { display: String, err: String },
     Recorded { display: String, path: String },
@@ -891,7 +854,6 @@ enum LibCmd {
     SavePlaylist(String, Vec<String>),
     Meta(String),
     ArtLocal(String),
-    EqEncode(u64, String, Vec<f32>),
     Transcode { display: String, audio: String },
     Record { display: String, audio: String, dest: String },
     RecordRadio { display: String, url: String, dest: String },
@@ -906,7 +868,11 @@ enum LibCmd {
 enum NetCmd {
     WebArt(String, String),
     Lyrics(String, String),
-    YtDownload(String),
+}
+
+enum YtCmd {
+    Download { query: String, auto_play: bool, chunks: u32 },
+    Resolve { idx: usize, query: String },
 }
 
 fn collect_audio(dir: &str) -> Vec<String> {
@@ -1221,6 +1187,167 @@ where
     }
 }
 
+fn eq_peaking_coeffs(f0: f64, q: f64, fs: f64, db: f64) -> Biquad {
+    // RBJ cookbook peaking EQ, normalized to a0
+    let a = 10.0f64.powf(db / 40.0);
+    let w0 = 2.0 * std::f64::consts::PI * f0 / fs;
+    let c = w0.cos();
+    let s = w0.sin();
+    let alpha = s / (2.0 * q);
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * c;
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * c;
+    let a2 = 1.0 - alpha / a;
+    Biquad { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, x1: 0.0, x2: 0.0, y1: 0.0, y2: 0.0 }
+}
+
+struct EqShared {
+    gains: [f32; 10],
+    dirty: bool,
+}
+
+struct EqSource<S> {
+    inner: S,
+    ch: u16,
+    ch_pos: u16,
+    shared: std::sync::Arc<std::sync::Mutex<EqShared>>,
+    gains: [f32; 10],
+    preamp: f32,
+    biquads: [[Biquad; 10]; 2],
+}
+
+impl<S: rodio::Source> EqSource<S>
+where
+    S::Item: rodio::Sample,
+    f32: cpal::FromSample<S::Item>,
+{
+    fn new(inner: S, shared: std::sync::Arc<std::sync::Mutex<EqShared>>) -> Self {
+        let ch = inner.channels().max(1);
+        let fs = inner.sample_rate() as f64;
+        let mut gains = [0.0f32; 10];
+        if let Ok(st) = shared.lock() {
+            gains = st.gains;
+        }
+        let mut biquads = [[eq_peaking_coeffs(EQ_BANDS[0], EQ_Q, fs, 0.0); 10]; 2];
+        for i in 0..10 {
+            biquads[0][i] = eq_peaking_coeffs(EQ_BANDS[i], EQ_Q, fs, gains[i] as f64);
+        }
+        biquads[1] = biquads[0].clone();
+        let preamp = eq_auto_preamp(&gains, fs);
+        EqSource { inner, ch, ch_pos: 0, shared, gains, preamp, biquads }
+    }
+
+    fn sync_gains(&mut self) {
+        if let Ok(mut st) = self.shared.lock() {
+            if st.dirty {
+                st.dirty = false;
+                if self.gains != st.gains {
+                    self.gains = st.gains;
+                    let fs = self.inner.sample_rate() as f64;
+                    for i in 0..10 {
+                        let b = eq_peaking_coeffs(EQ_BANDS[i], EQ_Q, fs, self.gains[i] as f64);
+                        self.biquads[0][i] = b;
+                        self.biquads[1][i] = b;
+                    }
+                    self.preamp = eq_auto_preamp(&self.gains, fs);
+                }
+            }
+        }
+    }
+}
+
+impl<S: rodio::Source> Iterator for EqSource<S>
+where
+    S::Item: rodio::Sample,
+    f32: cpal::FromSample<S::Item>,
+{
+    type Item = f32;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ch_pos == 0 {
+            self.sync_gains();
+        }
+        let v = self.inner.next()?;
+        let mut x = <f32 as cpal::Sample>::from_sample(v) as f64;
+        let ci = self.ch_pos as usize;
+        for i in 0..10 {
+            x = self.biquads[ci][i].process(x);
+        }
+        let out = (x * self.preamp as f64).clamp(-1.0, 1.0) as f32;
+        self.ch_pos = (self.ch_pos + 1) % self.ch;
+        Some(out)
+    }
+}
+
+impl<S: rodio::Source> rodio::Source for EqSource<S>
+where
+    S::Item: rodio::Sample,
+    f32: cpal::FromSample<S::Item>,
+{
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        self.inner.total_duration()
+    }
+    fn try_seek(&mut self, pos: std::time::Duration) -> Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(pos)
+    }
+}
+
+fn eq_response_linear(freq: f64, gains: &[f32; 10], fs: f64) -> f64 {
+    let w = 2.0 * std::f64::consts::PI * freq / fs;
+    let c1 = w.cos();
+    let s1 = w.sin();
+    let c2 = (2.0 * w).cos();
+    let s2 = (2.0 * w).sin();
+    let nyq = fs / 2.0;
+    let mut mag = 1.0;
+    for i in 0..10 {
+        let db = gains[i] as f64;
+        if db.abs() < 0.5 {
+            continue;
+        }
+        let b = eq_peaking_coeffs(EQ_BANDS[i].min(nyq - 100.0).max(40.0), EQ_Q, fs, db);
+        let num_re = b.b0 + b.b1 * c1 + b.b2 * c2;
+        let num_im = -b.b1 * s1 - b.b2 * s2;
+        let den_re = 1.0 + b.a1 * c1 + b.a2 * c2;
+        let den_im = -b.a1 * s1 - b.a2 * s2;
+        let m = (num_re * num_re + num_im * num_im).sqrt()
+            / (den_re * den_re + den_im * den_im).max(1e-12).sqrt();
+        mag *= m;
+    }
+    mag
+}
+
+fn eq_auto_preamp(gains: &[f32; 10], fs: f64) -> f32 {
+    let mut peak = 1.0f64;
+    let mut f = 22.0;
+    while f <= 20000.0 {
+        peak = peak.max(eq_response_linear(f, gains, fs));
+        f *= 1.06;
+    }
+    if peak > 1.0 { (1.0 / peak).min(1.0) as f32 } else { 1.0 }
+}
+
+fn eq_curve_db(gains: &[f32; 10], fs: f64, points: &mut Vec<(f32, f32)>) {
+    const MIN: f64 = 20.0;
+    const MAX: f64 = 20000.0;
+    let n = points.len();
+    for i in 0..n {
+        let f = MIN * (MAX / MIN).powf(i as f64 / (n - 1).max(1) as f64);
+        let r = eq_response_linear(f, gains, fs).max(1e-9);
+        points[i] = (f as f32, (20.0 * r.log10()) as f32);
+    }
+}
+
 struct PipeSource {
     reader: BufReader<ChildStdout>,
     pending: VecDeque<i16>,
@@ -1511,7 +1638,7 @@ fn fmt_time(s: f32) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
-fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
+fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>, clock: std::sync::Arc<std::sync::atomic::AtomicU64>) {
     let video_pause = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut video_child: Option<Child> = None;
     let mut video_thread: Option<std::thread::JoinHandle<()>> = None;
@@ -1520,7 +1647,7 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
     }
     while let Ok(cmd) = rx.recv() {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_lib(cmd, &tx, &video_pause, &mut video_child, &mut video_thread);
+            handle_lib(cmd, &tx, &video_pause, &mut video_child, &mut video_thread, &clock);
         }));
         if let Err(p) = res {
             let msg = if let Some(s) = p.downcast_ref::<&str>() { (*s).to_string() }
@@ -1531,7 +1658,24 @@ fn lib_loop(rx: Receiver<LibCmd>, tx: Sender<Msg>) {
     }
 }
 
-fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::sync::atomic::AtomicBool>, video_child: &mut Option<Child>, video_thread: &mut Option<std::thread::JoinHandle<()>>) {
+fn handle_lib(cmd: LibCmd, tx: &Sender<Msg>, video_pause: &std::sync::Arc<std::sync::atomic::AtomicBool>, video_child: &mut Option<Child>, video_thread: &mut Option<std::thread::JoinHandle<()>>, clock: &std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        av_log(match &cmd {
+            LibCmd::Scan(_) => "lib: Scan",
+            LibCmd::AddMany(_) => "lib: AddMany",
+            LibCmd::LoadPlaylist(_) => "lib: LoadPlaylist",
+            LibCmd::SavePlaylist(..) => "lib: SavePlaylist",
+            LibCmd::Meta(_) => "lib: Meta",
+            LibCmd::ArtLocal(_) => "lib: ArtLocal",
+            LibCmd::Transcode { .. } => "lib: Transcode",
+            LibCmd::Record { .. } => "lib: Record",
+            LibCmd::RecordRadio { .. } => "lib: RecordRadio",
+            LibCmd::FindMusicFolder => "lib: FindMusicFolder",
+            LibCmd::VideoOpen { .. } => "lib: VideoOpen",
+            LibCmd::VideoClose => "lib: VideoClose",
+            LibCmd::VideoPause(_) => "lib: VideoPause",
+            LibCmd::VideoAnalyze { .. } => "lib: VideoAnalyze",
+            LibCmd::VideoCut { .. } => "lib: VideoCut",
+        });
         match cmd {
 LibCmd::Scan(dir) => {
                 let tx2 = tx.clone();
@@ -1600,17 +1744,6 @@ LibCmd::Scan(dir) => {
                 let bytes = find_local_art(&path);
                 let _ = tx.send(Msg::ArtLocal { bytes });
             }
-            LibCmd::EqEncode(rid, path, bands) => {
-                let bands_arr: [f32; 10] = bands.as_slice().try_into().unwrap_or([0.0; 10]);
-                let out = eq_out_path(rid);
-                match encode_eq(&path, &bands_arr, &out) {
-                    Ok(()) => { let _ = tx.send(Msg::EqReady(rid)); }
-                    Err(e) => {
-                        let _ = tx.send(Msg::Error(format!("EQ failed: {}", e)));
-                        let _ = tx.send(Msg::EqFailed(rid));
-                    }
-                }
-            }
             LibCmd::Transcode { display, audio } => {
                 match transcode_with_ffmpeg(&audio, &ffmpeg_path()) {
                     Ok(wav) => { let _ = tx.send(Msg::Transcoded { display, wav }); }
@@ -1634,9 +1767,13 @@ LibCmd::Scan(dir) => {
                 let _ = tx.send(Msg::FolderFound { folder });
             }
             LibCmd::VideoOpen { path, gen, seek } => {
+                av_log(&format!("open: RECEIVED gen={} (queue behind previous cmd?)", gen));
                 if let Some(mut c) = video_child.take() { let _ = c.kill(); }
                 if let Some(t) = video_thread.take() { let _ = t.join(); }
+                av_log("open: old video killed+joined");
+                let t_open = std::time::Instant::now();
                 let (sw, sh, sfps) = probe_video_info(&path);
+                av_log(&format!("open: probe_info {}x{} fps={} took {}ms", sw, sh, sfps, t_open.elapsed().as_millis()));
                 let (tw, th) = fit_video_dims(sw, sh, 1920, 1080);
                 let fps = if sfps > 0.0 { sfps } else { 24.0 };
                 let mut cmd = std::process::Command::new(ffmpeg_path());
@@ -1656,12 +1793,20 @@ LibCmd::Scan(dir) => {
                         return;
                     }
                 };
-                let dur = probe_video_duration(&path);
-                let _ = tx.send(Msg::VideoMeta { gen, dur });
+                av_log(&format!("open: ffmpeg spawned at {}ms", t_open.elapsed().as_millis()));
+                {
+                    let tx2 = tx.clone();
+                    let p = path.clone();
+                    std::thread::spawn(move || {
+                        let dur = probe_video_duration(&p);
+                        let _ = tx2.send(Msg::VideoMeta { gen, dur });
+                    });
+                }
                 if let Some(stdout) = child.stdout.take() {
                     let w = tw;
                     let h = th;
                     let pausef = std::sync::Arc::clone(video_pause);
+                    let clock = std::sync::Arc::clone(clock);
                     let tx2 = tx.clone();
                     let gen2 = gen;
                     let pos_send = (fps as u64).max(1);
@@ -1671,10 +1816,10 @@ LibCmd::Scan(dir) => {
                         let mut buf = vec![0u8; frame];
                         let mut pipe = stdout;
                         let fps = fps;
+                        let mygen = (gen2 & 0xFFFF) as u16;
                         let frame_t = std::time::Duration::from_secs_f64(1.0 / fps as f64);
                         let mut next_t = std::time::Instant::now();
                         let mut was_paused = false;
-                        let mut pacing_locked = false;
                         let mut frames: u64 = 0;
                         loop {
                             let paused = pausef.load(std::sync::atomic::Ordering::Relaxed);
@@ -1687,28 +1832,58 @@ LibCmd::Scan(dir) => {
                                 next_t = std::time::Instant::now();
                                 was_paused = false;
                             }
-                            let now = std::time::Instant::now();
-                            if now < next_t {
-                                std::thread::sleep(next_t - now);
-                                continue;
+                            let target = frames as f32 / fps;
+                            let wait_start = std::time::Instant::now();
+                            loop {
+                                let c = clock.load(std::sync::atomic::Ordering::Relaxed);
+                                if c != 0 && ((c >> 48) as u16) == mygen {
+                                    let cpos = c & ((1u64 << 48) - 1);
+                                    if cpos != 0 {
+                                        let apos = (cpos - 1) as f32 / 1000.0;
+                                        if apos + 0.030 >= target {
+                                            break;
+                                        }
+                                        if wait_start.elapsed() > std::time::Duration::from_millis(250) {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(4));
+                                        continue;
+                                    }
+                                }
+                                let now = std::time::Instant::now();
+                                if now >= next_t {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(2));
                             }
                             if pipe.read_exact(&mut buf).is_err() {
                                 break;
                             }
-                            let mut rgba = Vec::with_capacity(frame / 3 * 4);
-                            for p in buf.chunks_exact(3) {
-                                rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
+                            let mut drop_frame = false;
+                            let c = clock.load(std::sync::atomic::Ordering::Relaxed);
+                            if c != 0 && ((c >> 48) as u16) == mygen {
+                                let cpos = c & ((1u64 << 48) - 1);
+                                if cpos != 0 && frames > 0 {
+                                    let apos = (cpos - 1) as f32 / 1000.0;
+                                    if apos > target + 0.75 {
+                                        drop_frame = true;
+                                    }
+                                }
                             }
-                            if tx2.send(Msg::VideoFrame { w, h, rgba, gen: gen2 }).is_err() {
-                                break;
+                            if !drop_frame {
+                                let mut rgba = Vec::with_capacity(frame / 3 * 4);
+                                for p in buf.chunks_exact(3) {
+                                    rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
+                                }
+                                if tx2.send(Msg::VideoFrame { w, h, rgba, gen: gen2 }).is_err() {
+                                    break;
+                                }
+                                if frames == 0 {
+                                    av_log("reader: first frame sent");
+                                }
                             }
                             frames += 1;
-                            if !pacing_locked {
-                                next_t = std::time::Instant::now();
-                                pacing_locked = true;
-                            } else {
-                                next_t += frame_t;
-                            }
+                            next_t = std::time::Instant::now() + frame_t;
                             if frames % pos_send == 0 {
                                 let secs = seek + frames as f32 / fps;
                                 if tx2.send(Msg::VideoPos { gen, secs }).is_err() {
@@ -1861,137 +2036,6 @@ fn load_tagged(path: &str) -> Option<lofty::file::TaggedFile> {
     probe.read().ok()
 }
 
-fn encode_eq(path: &str, bands: &[f32; 10], out: &Path) -> Result<(), String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode_eq_impl(path, bands, out))) {
-        Ok(r) => r,
-        Err(_) => Err("EQ render panicked: file not decodable".into()),
-    }
-}
-
-fn encode_eq_impl(path: &str, bands: &[f32; 10], out: &Path) -> Result<(), String> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
-
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
-        .map_err(|e| format!("probe: {}", e))?;
-    let mut format = probed.format;
-    let track = format.default_track().ok_or("no audio track")?;
-    let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default()).map_err(|e| format!("decoder: {}", e))?;
-
-    let mut left: Vec<f64> = Vec::new();
-    let mut right: Vec<f64> = Vec::new();
-    let mut rate: u32 = 0;
-    let mut channels: usize = 0;
-    let mut framed = false;
-
-    loop {
-        match format.next_packet() {
-            Ok(packet) => {
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let spec = *decoded.spec();
-                        let frames = decoded.frames();
-                        let mut sbuf = SampleBuffer::<f32>::new(frames as u64, spec);
-                        sbuf.copy_interleaved_ref(decoded);
-                        let data = sbuf.samples();
-                        if data.is_empty() { continue; }
-                        rate = spec.rate;
-                        channels = spec.channels.count();
-                        framed = true;
-                        if channels <= 1 {
-                            for &s in data {
-                                left.push(s as f64);
-                            }
-                        } else {
-                            let per = data.len() / channels;
-                            for frame in 0..per {
-                                left.push(data[frame * channels] as f64);
-                                right.push(data[frame * channels + 1] as f64);
-                            }
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            }
-            Err(symphonia::core::errors::Error::IoError(_)) => break,
-            Err(_) => break,
-        }
-    }
-    if !framed || left.is_empty() {
-        return Err("no audio decoded".into());
-    }
-
-    let nyquist = rate as f64 / 2.0;
-    let fs = rate as f64;
-    let band_gains: Vec<(f64, f64)> = EQ_BANDS
-        .iter()
-        .enumerate()
-        .filter_map(|(i, f0)| {
-            let db = bands[i] as f64;
-            if db.abs() < 0.5 {
-                return None;
-            }
-            let freq = (*f0).min(nyquist - 100.0).max(40.0);
-            let g = db.signum() * (10.0_f64.powf(db.abs() / 20.0) - 1.0);
-            Some((freq, g))
-        })
-        .collect();
-    let mixed: Vec<(f64, Vec<f64>)> = std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        let lref = &left;
-        for (freq, gain) in band_gains {
-            handles.push(s.spawn(move || {
-                let f = Biquad::bandpass_q(freq, EQ_Q, fs);
-                let filt = filter_signal(lref, &f);
-                (gain, filt)
-            }));
-        }
-        handles.into_iter().map(|h| h.join().expect("eq band thread")).collect()
-    });
-    for (gain, fv) in mixed {
-        for (j, fv) in fv.iter().enumerate() {
-            left[j] += gain * fv;
-            if channels > 1 {
-                right[j] += gain * fv;
-            }
-        }
-    }
-
-    let _ = std::fs::remove_file(out);
-    let wspec = hound::WavSpec {
-        channels: if channels > 1 { 2 } else { 1 } as u16,
-        sample_rate: rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let f = File::create(out).map_err(|e| e.to_string())?;
-    let mut wr = hound::WavWriter::new(f, wspec).map_err(|e| e.to_string())?;
-    let to_i16 = |v: f64| (v.clamp(-1.0, 1.0) * 32767.0) as i16;
-    if channels > 1 {
-        for j in 0..left.len() {
-            let _ = wr.write_sample(to_i16(left[j]));
-            let _ = wr.write_sample(to_i16(right[j]));
-        }
-    } else {
-        for v in &left {
-            let _ = wr.write_sample(to_i16(*v));
-        }
-    }
-    wr.finalize().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 fn net_loop(rx: Receiver<NetCmd>, tx: Sender<Msg>) {
     while let Ok(cmd) = rx.recv() {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2004,12 +2048,25 @@ fn net_loop(rx: Receiver<NetCmd>, tx: Sender<Msg>) {
                     let text = fetch_lyrics(&artist, &title);
                     let _ = tx.send(Msg::Lyrics { artist, title, text });
                 }
-                NetCmd::YtDownload(query) => {
-                    let r = yt_download_and_store(&query, &tx);
+            }
+        }));
+    }
+}
+
+fn yt_loop(rx: Receiver<YtCmd>, tx: Sender<Msg>) {
+    while let Ok(cmd) = rx.recv() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match cmd {
+                YtCmd::Download { query, auto_play, chunks } => {
+                    let r = yt_download_and_store(&query, chunks, &tx);
                     match r {
-                        Ok(path) => { let _ = tx.send(Msg::YtDone { path }); }
-                        Err(e) => { let _ = tx.send(Msg::YtFail(e)); }
+                        Ok(path) => { let _ = tx.send(Msg::YtDone { path, auto_play }); }
+                        Err(e) => { let _ = tx.send(Msg::YtFail { err: e, auto_play }); }
                     }
+                }
+                YtCmd::Resolve { idx, query } => {
+                    let display = yt_resolve_title(&query);
+                    let _ = tx.send(Msg::YtResolved { idx, query, display });
                 }
             }
         }));
@@ -2296,7 +2353,19 @@ fn yt_lookup(yt: &Path, target: &str) -> Result<(String, String, String, String,
     ))
 }
 
-fn yt_grab(yt: &Path, ffmpeg: &Path, target: &str, id: &str, tx: &Sender<Msg>) -> Result<PathBuf, String> {
+fn yt_resolve_title(query: &str) -> String {
+    let q = query.trim();
+    if q.is_empty() || !ytdlp_path().is_file() {
+        return query.to_string();
+    }
+    let target = if q.starts_with("http") { q.to_string() } else { format!("ytsearch1:{}", q) };
+    match yt_lookup(&ytdlp_path(), &target) {
+        Ok((_, title, _, _, _)) if !title.is_empty() => title,
+        _ => query.to_string(),
+    }
+}
+
+fn yt_grab(yt: &Path, ffmpeg: &Path, target: &str, id: &str, chunks: u32, tx: &Sender<Msg>) -> Result<PathBuf, String> {
     use std::io::BufRead;
     use std::process::Stdio;
     let tmp = std::env::temp_dir().join("mediaplayerofdoom_yt");
@@ -2318,6 +2387,7 @@ fn yt_grab(yt: &Path, ffmpeg: &Path, target: &str, id: &str, tx: &Sender<Msg>) -
             "--embed-thumbnail",
             "--convert-thumbnails", "jpg",
             "--parse-metadata", "%(uploader)s:%(artist)s",
+            "-N", &chunks.to_string(),
             "-o", &tpl.to_string_lossy(),
             target,
         ])
@@ -2354,7 +2424,7 @@ fn yt_grab(yt: &Path, ffmpeg: &Path, target: &str, id: &str, tx: &Sender<Msg>) -
     Ok(final_mp3)
 }
 
-fn yt_download_and_store(query: &str, tx: &Sender<Msg>) -> Result<PathBuf, String> {
+fn yt_download_and_store(query: &str, chunks: u32, tx: &Sender<Msg>) -> Result<PathBuf, String> {
     ensure_tools(tx)?;
     let q = query.trim();
     if q.is_empty() {
@@ -2367,23 +2437,43 @@ fn yt_download_and_store(query: &str, tx: &Sender<Msg>) -> Result<PathBuf, Strin
         display = id.clone();
     }
     let _ = tx.send(Msg::YtStatus(format!("Downloading \"{}\"...", display)));
-    let mp3 = yt_grab(&ytdlp_path(), &ffmpeg_path(), &target, &id, tx)?;
+    let mp3 = yt_grab(&ytdlp_path(), &ffmpeg_path(), &target, &id, chunks, tx)?;
     let artist = if artist.is_empty() { uploader } else { artist };
     let artist = if artist.is_empty() { "Unknown".to_string() } else { artist };
-    let album_d = if album.is_empty() { "Singles".to_string() } else { album };
-    let folder = music_folder().join(format!("{} - {}", sanitize_win(&artist), sanitize_win(&album_d)));
-    let _ = std::fs::create_dir_all(&folder);
+    let folder = artist_album_folder(&music_folder(), &artist, &album);
     let num = next_track_num(&folder);
-    let mut fname = format!("{:03} - {} ({}).mp3", num, sanitize_win(&title), sanitize_win(&artist));
+    let mut fname = format!("{:03} - {}.mp3", num, sanitize_win(&title));
     let mut final_path = folder.join(&fname);
     let mut extra = 0u32;
     while final_path.exists() {
         extra += 1;
-        fname = format!("{:03}.{} - {} ({}).mp3", num, extra, sanitize_win(&title), sanitize_win(&artist));
+        fname = format!("{:03}.{} - {}.mp3", num, extra, sanitize_win(&title));
         final_path = folder.join(&fname);
     }
     std::fs::rename(&mp3, &final_path).map_err(|e| format!("could not save to Music folder: {}", e))?;
     Ok(final_path)
+}
+
+fn artist_album_folder(root: &Path, artist: &str, album: &str) -> PathBuf {
+    let album_d = if album.trim().is_empty() { "Singles".to_string() } else { album.to_string() };
+    let want = format!("{} - {}", sanitize_win(artist), sanitize_win(&album_d));
+    let want_l = want.to_lowercase();
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if let Some(n) = p.file_name().map(|f| f.to_string_lossy().to_lowercase()) {
+                if n == want_l {
+                    return p;
+                }
+            }
+        }
+    }
+    let folder = root.join(&want);
+    let _ = std::fs::create_dir_all(&folder);
+    folder
 }
 
 struct PlayerApp {
@@ -2396,6 +2486,7 @@ struct PlayerApp {
     history_path: PathBuf,
     lib_tx: Sender<LibCmd>,
     net_tx: Sender<NetCmd>,
+    yt_tx: Sender<YtCmd>,
     msg_rx: Receiver<Msg>,
     status: String,
     error: String,
@@ -2412,10 +2503,13 @@ struct PlayerApp {
     pl_last_cur: Option<usize>,
     search_query: String,
     yt_query: String,
-    eq_pending: Option<String>,
+    yt_queue_mode: bool,
+    yt_queue: Vec<(String, String)>,
+    yt_queue_processing: bool,
+    yt_queue_active: Option<String>,
+    yt_queue_show: bool,
+    eq_shared: std::sync::Arc<std::sync::Mutex<EqShared>>,
     eq_resume: Option<Duration>,
-    eq_req_id: u64,
-    eq_dirty: bool,
     yt_log: Vec<String>,
     yt_pct: f32,
     yt_speed: String,
@@ -2459,6 +2553,8 @@ struct PlayerApp {
     eq_custom: Option<[f32; 10]>,
     lyrics: Option<String>,
     lyrics_title: String,
+    lyrics_for: Option<String>,
+    web_art_for: Option<String>,
     viz_bars: Vec<f32>,
     viz_peaks: Vec<f32>,
     viz_lock: std::sync::Arc<std::sync::Mutex<VizState>>,
@@ -2508,6 +2604,10 @@ struct PlayerApp {
     video_sink: Option<Sink>,
     video_audio_proc: Option<Child>,
     video_audio_pending: bool,
+    video_open_at: f64,
+    video_clock: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    video_seek_base: f32,
+    video_deferred_open: bool,
     video_last_mouse: f64,
     video_bar_visible: bool,
     video_queue: Vec<String>,
@@ -2558,6 +2658,8 @@ impl PlayerApp {
         let mut video_positions: HashMap<String, f32> = HashMap::new();
         let mut intro_skip_enabled = false;
         let mut intro_skip_secs: f32 = 90.0;
+        let mut eq_on = false;
+        let mut eq_custom: Option<[f32; 10]> = None;
         let mut credits_skip_secs: f32 = 90.0;
         let mut video_bounds: HashMap<String, (f32, f32)> = HashMap::new();
         let mut show_bounds: HashMap<String, (f32, f32)> = HashMap::new();
@@ -2578,6 +2680,9 @@ impl PlayerApp {
                 credits_skip_secs = s.credits_skip_secs;
                 video_bounds = s.video_bounds;
                 show_bounds = s.show_bounds;
+                eq_on = s.eq_on;
+                if !s.eq_preset.is_empty() { state.eq_preset = s.eq_preset; }
+                eq_custom = s.eq_custom;
             }
         }
         if let Ok(text) = std::fs::read_to_string(&history_path) {
@@ -2587,16 +2692,23 @@ impl PlayerApp {
         }
         sink.set_volume(state.volume as f32 / 100.0);
 
+        let video_clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (lib_tx, lib_rx) = channel::<LibCmd>();
         let (net_tx, net_rx) = channel::<NetCmd>();
+        let (yt_tx, yt_rx) = channel::<YtCmd>();
         let (msg_tx, msg_rx) = channel::<Msg>();
         {
             let tx = msg_tx.clone();
-            thread::spawn(move || lib_loop(lib_rx, tx));
+            let clock = std::sync::Arc::clone(&video_clock);
+            thread::spawn(move || lib_loop(lib_rx, tx, clock));
         }
         {
             let tx = msg_tx.clone();
             thread::spawn(move || net_loop(net_rx, tx));
+        }
+        {
+            let tx = msg_tx.clone();
+            thread::spawn(move || yt_loop(yt_rx, tx));
         }
 
         let display_cache: Vec<String> = state.playlist.iter().map(|p| make_display(p)).collect();
@@ -2617,7 +2729,7 @@ impl PlayerApp {
         let hotkeys = make_hotkeys();
         let (show_id, quit_id) = hotkeys.as_ref().map(|(_, s, q)| (*s, *q)).unwrap_or((0, 0));
 
-        let app = Self {
+        let mut app = Self {
             ctx: ctx.clone(),
             _stream: stream,
             _stream_handle: handle,
@@ -2627,6 +2739,7 @@ impl PlayerApp {
             history_path,
             lib_tx,
             net_tx,
+            yt_tx,
             msg_rx,
             status: format!("{} v{} - ready", APP_NAME, APP_VERSION),
             error: String::new(),
@@ -2643,10 +2756,13 @@ impl PlayerApp {
             pl_last_cur: None,
             search_query: String::new(),
             yt_query: String::new(),
-            eq_pending: None,
+            yt_queue_mode: false,
+            yt_queue: Vec::new(),
+            yt_queue_processing: false,
+            yt_queue_active: None,
+            yt_queue_show: false,
+            eq_shared: std::sync::Arc::new(std::sync::Mutex::new(EqShared { gains: [0.0; 10], dirty: false })),
             eq_resume: None,
-            eq_req_id: 0,
-            eq_dirty: false,
             yt_log: Vec::new(),
             yt_pct: -1.0,
             yt_speed: String::new(),
@@ -2707,6 +2823,10 @@ impl PlayerApp {
             video_sink: None,
             video_audio_proc: None,
             video_audio_pending: false,
+            video_open_at: 0.0,
+            video_clock,
+            video_seek_base: 0.0,
+            video_deferred_open: false,
             video_last_mouse: 0.0,
             video_bar_visible: false,
             video_queue: Vec::new(),
@@ -2747,10 +2867,12 @@ video_ended: false,
             show_help: false,
             search_focus: false,
             yt_focus: false,
-            eq_on: false,
-            eq_custom: None,
+            eq_on,
+            eq_custom,
             lyrics: None,
             lyrics_title: String::new(),
+            lyrics_for: None,
+            web_art_for: None,
             viz_bars: vec![2.0; 12],
             viz_peaks: vec![0.0; 12],
             viz_lock: std::sync::Arc::new(std::sync::Mutex::new(VizState::default())),
@@ -2767,6 +2889,7 @@ video_ended: false,
             show_id,
             quit_id,
         };
+        app.apply_eq_live();
         let _ = app.lib_tx.send(LibCmd::FindMusicFolder);
         Ok(app)
     }
@@ -2787,6 +2910,9 @@ video_ended: false,
             credits_skip_secs: self.credits_skip_secs,
             video_bounds: self.video_bounds.clone(),
             show_bounds: self.show_bounds.clone(),
+            eq_on: self.eq_on,
+            eq_preset: self.eq_name().to_string(),
+            eq_custom: self.eq_custom,
             video_cut_cache: self.video_cut_cache.clone(),
             video_cut_inflight: self.video_cut_inflight.clone(),
         };
@@ -2939,6 +3065,18 @@ video_ended: false,
                 }
                 Msg::Meta { path, title, artist, album, duration } => {
                     if self.state.current_song.as_deref() == Some(&path) {
+                        let mut artist = artist;
+                        let mut album = album;
+                        if artist == "Unknown" || album == "Unknown" {
+                            if let Some((a, al)) = folder_artist_album(&path) {
+                                if artist == "Unknown" {
+                                    artist = a;
+                                }
+                                if album == "Unknown" {
+                                    album = al;
+                                }
+                            }
+                        }
                         self.meta = (title.clone(), artist.clone(), album.clone());
                         self.state.song_length = duration;
                         self.len_secs = duration.as_secs_f32();
@@ -2952,62 +3090,27 @@ video_ended: false,
                         self.load_art_texture(b);
                     } else if self.want_web {
                         let (a, al) = (self.meta.1.clone(), self.meta.2.clone());
+                        self.web_art_for = self.state.current_song.clone();
                         let _ = self.net_tx.send(NetCmd::WebArt(a, al));
                     }
                 }
                 Msg::ArtWeb { bytes } => {
-                    if let Some(b) = bytes {
-                        if self.want_web && !self.art_local_valid {
-                            self.load_art_texture(b);
+                    if self.web_art_for.as_deref() == self.state.current_song.as_deref() {
+                        if let Some(b) = bytes {
+                            if self.want_web && !self.art_local_valid {
+                                self.load_art_texture(b);
+                            }
                         }
                     }
                 }
                 Msg::Lyrics { artist, title, text } => {
-                    if let Some(t) = text {
-                        self.lyrics = Some(t);
-                        self.lyrics_title = format!("{} - {}", artist, title);
-                    } else {
-                        self.set_error("Lyrics not found");
-                    }
-                }
-                Msg::EqReady(rid) => {
-                    let current = rid == self.eq_req_id;
-                    let was_dirty = self.eq_dirty;
-                    if current {
-                        let p = self.eq_pending.take();
-                        self.eq_dirty = false;
-                        if !was_dirty {
-                            if let Some(p) = p {
-                                if self.state.current_song.as_deref() == Some(p.as_str()) {
-                                    self.swap_eq(&p);
-                                } else {
-                                    gc_eq_files(self.eq_req_id);
-                                }
-                            }
-                        } else if let Some(p) = p {
-                            gc_eq_files(self.eq_req_id);
-                            self.restart_current();
-                            let _ = p;
+                    if self.lyrics_for.as_deref() == self.state.current_song.as_deref() {
+                        if let Some(t) = text {
+                            self.lyrics = Some(t);
+                            self.lyrics_title = format!("{} - {}", artist, title);
+                        } else {
+                            self.set_error("Lyrics not found");
                         }
-                    } else if self.eq_pending.is_none() && self.eq_dirty {
-                        self.eq_dirty = false;
-                        self.restart_current();
-                    }
-                }
-                Msg::EqFailed(rid) => {
-                    let current = rid == self.eq_req_id;
-                    let was_dirty = self.eq_dirty;
-                    if current {
-                        if let Some(p) = self.eq_pending.take() {
-                            self.eq_dirty = false;
-                            self.set_error(format!("EQ failed for: {} (using original)", stem(&p)));
-                        }
-                        if was_dirty {
-                            self.restart_current();
-                        }
-                    } else if self.eq_pending.is_none() && self.eq_dirty {
-                        self.eq_dirty = false;
-                        self.restart_current();
                     }
                 }
                 Msg::YtStatus(s) => {
@@ -3027,7 +3130,7 @@ video_ended: false,
                         self.yt_log.drain(0..over);
                     }
                 }
-                Msg::YtDone { path } => {
+                Msg::YtDone { path, auto_play } => {
                     self.yt_pct = -1.0;
                     self.yt_speed.clear();
                     self.yt_eta.clear();
@@ -3039,14 +3142,29 @@ video_ended: false,
                         self.save_settings();
                         self.ingest_bands(&[s.clone()], None);
                     }
-                    self.play_song(&s);
+                    if auto_play {
+                        self.play_song(&s);
+                    }
                     self.set_status(format!("Downloaded: {}", stem(&s)));
+                    if !auto_play && self.yt_queue_processing {
+                        self.yt_queue_advance();
+                    }
                 }
-                Msg::YtFail(e) => {
+                Msg::YtFail { err, auto_play } => {
                     self.yt_pct = -1.0;
                     self.yt_speed.clear();
                     self.yt_eta.clear();
-                    self.set_error(e);
+                    self.set_error(err);
+                    if !auto_play && self.yt_queue_processing {
+                        self.yt_queue_advance();
+                    }
+                }
+                Msg::YtResolved { idx, query, display } => {
+                    if let Some(e) = self.yt_queue.get_mut(idx) {
+                        if e.0 == query {
+                            e.1 = display;
+                        }
+                    }
                 }
                 Msg::Transcoded { display, wav } => {
                     let wavs = wav.to_string_lossy().to_string();
@@ -3091,6 +3209,16 @@ video_ended: false,
                             self.video_audio_pending = false;
                             if let Some(s) = &self.video_sink {
                                 s.play();
+                                av_log("audio started on first frame");
+                            }
+                        }
+                        if self.video_deferred_open {
+                            self.video_deferred_open = false;
+                            av_log(&format!("FIRST FRAME {:.3}s after open", self.ctx.input(|i| i.time) - self.video_open_at));
+                            if let Some(p) = self.video_current.clone() {
+                                av_log(&format!("first frame shown, deferred analyze/cut for {}", p));
+                                self.maybe_analyze_video(&p);
+                                self.try_cut_current_video(p);
                             }
                         }
                     }
@@ -3114,15 +3242,31 @@ video_ended: false,
                 Msg::VideoPos { gen, secs } => {
                     if gen == self.video_gen {
                         self.video_cur_secs = secs;
+                        let apos = self.video_sink.as_ref().map(|s| s.get_pos().as_secs_f32()).unwrap_or(-1.0);
+                        if apos >= 0.0 && self.video_seek_base <= secs {
+                            let audio_file = self.video_seek_base + apos;
+                            av_log(&format!("tick video={:.3} audio={:.3} drift={:+.0}ms", secs, audio_file, (audio_file - secs) * 1000.0));
+                        }
                         if self.intro_skip_enabled && self.video_dur_secs > 0.0 {
-                            let (ie, cs) = self.video_bound_secs();
-                            if secs < ie && ie > 2.0 {
-                                self.seek_video(ie + 1.0);
-                                self.set_status(format!("Skipped intro → {:.0}s ({})", ie, fmt_time(ie)));
-                            } else if cs > 2.0 && secs >= cs {
-                                if !self.video_queue.is_empty() {
-                                    self.queue_next();
-                                    self.set_status("Skipped credits → next video");
+                            let cur_path = self.video_current.clone().unwrap_or_default();
+                            if !cur_path.ends_with("_cut.mkv") {
+                                let (ie, cs) = self.video_bound_secs();
+                                if secs < ie && ie > 2.0 {
+                                    if let Some(cut) = self.video_cut_cache.get(&cur_path).cloned() {
+                                        av_log(&format!("SKIP intro at {:.3}s -> cut file {}", secs, cut));
+                                        self.play_video_item(cut);
+                                        self.set_status("Auto-cut skip → cut file");
+                                    } else {
+                                        av_log(&format!("SKIP intro at {:.3}s -> seek {:.3}s (no cut file)", secs, ie + 1.0));
+                                        self.seek_video(ie + 1.0);
+                                        self.set_status(format!("Skipped intro → {:.0}s ({})", ie, fmt_time(ie)));
+                                    }
+                                } else if cs > 2.0 && secs >= cs {
+                                    if !self.video_queue.is_empty() {
+                                        av_log(&format!("SKIP credits at {:.3}s (cs={:.3}) -> next", secs, cs));
+                                        self.queue_next();
+                                        self.set_status("Skipped credits → next video");
+                                    }
                                 }
                             }
                         }
@@ -3199,10 +3343,6 @@ video_ended: false,
         }
     }
 
-    fn play_bands(&self) -> [f32; 10] {
-        self.eq_cur()
-    }
-
     fn play_song(&mut self, path: &str) {
         if path.is_empty() || !Path::new(path).is_file() {
             self.set_error("File not found");
@@ -3218,20 +3358,6 @@ video_ended: false,
         self.save_settings();
         self.playing = Self::playing_display(path);
         self.set_status(format!("Loading: {}...", stem(path)));
-
-        let use_eq = self.eq_on && self.state.eq_preset != "Flat";
-        if use_eq {
-            self.eq_req_id += 1;
-            let rid = self.eq_req_id;
-            self.eq_dirty = false;
-            self.eq_pending = Some(path.to_string());
-            self.do_play(path, path);
-            let bands = self.play_bands();
-            self.set_status(format!("EQ processing: {}...", stem(path)));
-            let _ = self.lib_tx.send(LibCmd::EqEncode(rid, path.to_string(), bands.to_vec()));
-            self.send_meta_art(path.to_string());
-            return;
-        }
         self.do_play(path, path);
     }
 
@@ -3240,6 +3366,9 @@ video_ended: false,
         self.art_tex = None;
         self.art_state = 1;
         self.art_local_valid = false;
+        self.want_web = false;
+        self.lyrics_for = None;
+        self.web_art_for = None;
         let _ = self.lib_tx.send(LibCmd::Meta(path.clone()));
         let _ = self.lib_tx.send(LibCmd::ArtLocal(path));
     }
@@ -3300,7 +3429,7 @@ video_ended: false,
         if self.len_secs <= 0.0 && dur > 0.0 {
             self.len_secs = dur;
         }
-        self.sink.append(self.tap_viz(src));
+        self.sink.append(self.tap_viz(EqSource::new(src, self.eq_shared.clone())));
         self.sink.play();
         self.state.current_song = Some(display.to_string());
         self.state.prev_songs.push(display.to_string());
@@ -3330,63 +3459,6 @@ video_ended: false,
         self.playing = Self::playing_display(display);
         self.set_status(format!("Playing: {}", stem(display)));
         self.send_meta_art(display.to_string());
-    }
-
-    fn swap_eq(&mut self, cur: &str) {
-        let out = eq_out_path(self.eq_req_id);
-        let src = match open_decoder(&out.to_string_lossy()) {
-            Some(s) => s,
-            None => {
-                gc_eq_files(self.eq_req_id);
-                self.set_error("EQ render unreadable, continuing original");
-                return;
-            }
-        };
-        gc_eq_files(self.eq_req_id);
-        let pos = self.pos.max(0.0);
-        self.sink.stop();
-        self.sink.set_volume(self.state.volume as f32 / 100.0);
-        self.sink.append(self.tap_viz(src));
-        self.sink.play();
-        self.state.is_paused = false;
-        self.play_started = Some(Instant::now());
-        if self.sink.try_seek(Duration::from_secs_f32(pos)).is_ok() {
-            self.pos = self.sink.get_pos().as_secs_f32();
-        } else {
-            self.pos = 0.0;
-        }
-        self.dragging = false;
-        self.set_status(format!("EQ: {} applied -> {}", self.eq_name(), stem(cur)));
-    }
-
-    fn restart_current(&mut self) {
-        let Some(cur) = self.state.current_song.clone() else { return };
-        if self.len_secs > 0.0 && self.pos >= (self.len_secs - 0.5).max(0.0) {
-            return;
-        }
-        if self.eq_pending.is_some() {
-            self.eq_dirty = true;
-            self.set_status("EQ: queued after current render");
-            return;
-        }
-        self.eq_req_id += 1;
-        let rid = self.eq_req_id;
-        self.eq_dirty = false;
-        let use_eq = self.eq_on && self.state.eq_preset != "Flat";
-        if use_eq {
-            self.eq_pending = Some(cur.clone());
-            self.set_status(format!("Applying EQ: {}...", stem(&cur)));
-            let bands = self.eq_cur();
-            let _ = self.lib_tx.send(LibCmd::EqEncode(rid, cur.clone(), bands.to_vec()));
-        } else {
-            self.eq_pending = None;
-            let pos = self.pos.max(0.0);
-            self.do_play(&cur, &cur);
-            if self.sink.try_seek(Duration::from_secs_f32(pos)).is_ok() {
-                self.pos = self.sink.get_pos().as_secs_f32();
-            }
-            self.set_status(format!("EQ off: {}", stem(&cur)));
-        }
     }
 
     fn skip_song(&mut self) {
@@ -3517,6 +3589,23 @@ video_ended: false,
         self.winding = None;
         self.wind_arm = None;
         self.wind_playing = false;
+        self.state.current_song = None;
+        self.state.is_paused = false;
+        self.playing.clear();
+        self.pos = 0.0;
+        self.len_secs = 0.0;
+        self.meta = (String::new(), "Unknown".to_string(), "Unknown".to_string());
+        self.lyrics = None;
+        self.lyrics_title = String::new();
+        self.art_local_valid = false;
+        self.tape_anim = 0.0;
+        self.tape_timer = 0.0;
+        for i in 0..self.viz_bars.len() {
+            self.viz_bars[i] = 2.0;
+            self.viz_peaks[i] = 0.0;
+        }
+        self.viz_rms = 0.0;
+        self.viz_pop = 0.0;
     }
 
     fn resume_tape(&mut self, path: &str, pos: f32) {
@@ -3625,7 +3714,7 @@ video_ended: false,
         self.radio_loading = true;
         match spawn_radio_stream(&st.url, &ffmpeg_path()) {
             Ok((proc, src)) => {
-                self.sink.append(self.tap_viz(src));
+                self.sink.append(self.tap_viz(EqSource::new(src, self.eq_shared.clone())));
                 self.sink.play();
                 self.state.is_paused = false;
                 self.radio_proc = Some(proc);
@@ -4139,28 +4228,56 @@ video_ended: false,
         self.set_status(format!("Theme: {}", self.state.theme));
     }
 
-    #[allow(dead_code)]
     fn cycle_eq(&mut self) {
-        self.eq_locked_notice();
-    }
-
-    #[allow(dead_code)]
-    fn cycle_eq_back(&mut self) {
-        self.eq_locked_notice();
-    }
-
-    #[allow(dead_code)]
-    fn eq_set(&mut self, _i: usize, _v: f32) {
-        self.eq_locked_notice();
-    }
-
-    fn eq_locked_notice(&mut self) {
-        self.eq_on = false;
+        let names: Vec<&'static str> = EQ_PRESETS.iter().map(|p| p.name).collect();
+        let cur = names.iter().position(|n| *n == self.state.eq_preset).unwrap_or(0);
+        let next = (cur + 1) % names.len();
+        self.state.eq_preset = names[next].to_string();
         self.eq_custom = None;
-        if self.state.eq_preset != "Flat" {
+        self.apply_eq_live();
+        self.save_settings();
+        self.set_status(format!("EQ: {}", self.eq_name()));
+    }
+
+    fn cycle_eq_back(&mut self) {
+        let names: Vec<&'static str> = EQ_PRESETS.iter().map(|p| p.name).collect();
+        let cur = names.iter().position(|n| *n == self.state.eq_preset).unwrap_or(0);
+        let prev = (cur + names.len() - 1) % names.len();
+        self.state.eq_preset = names[prev].to_string();
+        self.eq_custom = None;
+        self.apply_eq_live();
+        self.save_settings();
+        self.set_status(format!("EQ: {}", self.eq_name()));
+    }
+
+    fn eq_set(&mut self, i: usize, v: f32) {
+        if i >= 10 {
+            return;
+        }
+        if self.eq_custom.is_none() {
+            self.eq_custom = Some(self.eq_cur());
             self.state.eq_preset = "Flat".to_string();
         }
-        self.set_status("EQ disabled: caused issues, forced to Flat");
+        if let Some(c) = &mut self.eq_custom {
+            c[i] = v;
+        }
+        self.apply_eq_live();
+        self.save_settings();
+    }
+
+    fn apply_eq_live(&mut self) {
+        let gains = if self.eq_on { self.eq_cur() } else { [0.0; 10] };
+        if let Ok(mut st) = self.eq_shared.lock() {
+            st.gains = gains;
+            st.dirty = true;
+        }
+    }
+
+    fn eq_toggle(&mut self) {
+        self.eq_on = !self.eq_on;
+        self.apply_eq_live();
+        self.save_settings();
+        self.set_status(format!("EQ {}", if self.eq_on { format!("{}", self.eq_name()) } else { "off".into() }));
     }
 
     fn toggle_repeat(&mut self) {
@@ -5176,6 +5293,12 @@ video_ended: false,
                         self.stop_radio();
                     }
                 }
+                let pause_ready = self.play_started.is_some() || self.state.is_paused || self.radio_on;
+                let pause_col = if pause_ready { Color32::from_rgb(255, 220, 130) } else { darken(th.btn_fg, 0.5) };
+                let pause_lbl = if self.state.is_paused { "RESUME" } else { "PAUSE" };
+                if deck_key(ui, pause_lbl, pause_col, th.btn_bg).clicked() && pause_ready {
+                    self.toggle_pause();
+                }
                 let rec_lbl = if self.recording && (ui.input(|i| i.time) * 2.0).fract() < 0.5 {
                     "● REC"
                 } else {
@@ -5277,7 +5400,9 @@ video_ended: false,
 
             ui.horizontal_wrapped(|ui| {
                 if retro_btn(ui, &format!("Theme: {}", self.state.theme), th.playing_fg, th.btn_bg).clicked() { self.cycle_theme(); }
-                ui.label(RichText::new("EQ: DISABLED").color(darken(th.btn_fg, 0.35)).monospace().size(11.0));
+                if retro_btn(ui, &format!("EQ {}", if self.eq_on { self.eq_name() } else { "off" }), if self.eq_on { th.playing_fg } else { th.btn_fg }, th.btn_bg).clicked() { self.eq_toggle(); }
+                if retro_btn(ui, "◀ EQ", th.btn_fg, th.btn_bg).clicked() { self.cycle_eq_back(); }
+                if retro_btn(ui, "EQ ▶", th.btn_fg, th.btn_bg).clicked() { self.cycle_eq(); }
                 ui.separator();
                 ui.label(RichText::new("Sleep:").color(th.fg).monospace().size(11.0));
                 ui.add(egui::TextEdit::singleline(&mut self.sleep_input).desired_width(46.0).font(egui::TextStyle::Monospace).text_color(th.playing_fg));
@@ -5288,6 +5413,60 @@ video_ended: false,
                 let sleep_label = if self.sleep_minutes > 0 { format!("Timer: {}m", self.sleep_minutes) } else { "Timer: Off".to_string() };
                 lcd(ui, &sleep_label, if self.sleep_minutes > 0 { th.playing_fg } else { th.btn_fg }, th.bg);
             });
+
+            if self.eq_on {
+                let gains = self.eq_cur();
+                let preamp = eq_auto_preamp(&gains, 44100.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("EQ CURVE:").color(th.fg).monospace().size(11.0));
+                    let mut pts = vec![(0.0f32, 0.0f32); 128];
+                    eq_curve_db(&gains, 44100.0, &mut pts);
+                    let (graph_rect, _) = ui.allocate_exact_size(egui::vec2(460.0, 92.0), egui::Sense::hover());
+                    if ui.is_rect_visible(graph_rect) {
+                        let p = ui.painter().with_clip_rect(graph_rect);
+                        p.rect_filled(graph_rect, 3.0, Color32::from_rgb(6, 8, 10));
+                        p.rect_stroke(graph_rect, 3.0, egui::Stroke::new(1.0, darken(th.accent, 0.55)), egui::StrokeKind::Inside);
+                        let x_for = |f: f32| graph_rect.left() + (f.log10() - 20.0f32.log10()) / (20000.0f32.log10() - 20.0f32.log10()) * graph_rect.width();
+                        let y_for = |db: f32| graph_rect.center().y - db / 18.0 * (graph_rect.height() * 0.86 / 2.0);
+                        p.hline(graph_rect.left() + 4.0..=graph_rect.right() - 4.0, graph_rect.center().y, egui::Stroke::new(1.0, Color32::from_gray(42)));
+                        for &f0 in EQ_BANDS.iter() {
+                            let x = x_for(f0 as f32);
+                            p.line_segment([egui::pos2(x, graph_rect.top() + 4.0), egui::pos2(x, graph_rect.bottom() - 4.0)], egui::Stroke::new(1.0, Color32::from_gray(28)));
+                        }
+                        let mut prev: Option<egui::Pos2> = None;
+                        let line_col = if gains.iter().all(|&g| g.abs() < 0.5) { th.btn_fg } else { th.accent };
+                        for &(f, db) in pts.iter() {
+                            let cpt = egui::pos2(x_for(f), y_for(db));
+                            if let Some(pp) = prev {
+                                p.line_segment([pp, cpt], egui::Stroke::new(2.0, line_col));
+                            }
+                            prev = Some(cpt);
+                        }
+                        for (i, &f0) in EQ_BANDS.iter().enumerate() {
+                            let g = gains[i];
+                            let cpt = egui::pos2(x_for(f0 as f32), y_for(g as f32));
+                            p.circle_filled(cpt, 3.0, if g.abs() >= 0.5 { th.playing_fg } else { Color32::from_gray(70) });
+                            let ftext = if f0 >= 1000.0 { format!("{:.0}k", f0 / 1000.0) } else { format!("{}", f0 as i32) };
+                            p.text(egui::pos2(x_for(f0 as f32), graph_rect.bottom() - 8.0), egui::Align2::CENTER_TOP, ftext, egui::FontId::monospace(8.0), Color32::from_gray(110));
+                        }
+                        p.text(egui::pos2(graph_rect.left() + 6.0, graph_rect.top() + 8.0), egui::Align2::LEFT_TOP, format!("{} dB · preamp {:.0}%", self.eq_name(), preamp * 100.0), egui::FontId::monospace(9.0), th.playing_fg);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for i in 0..10 {
+                        let mut g = gains[i];
+                        ui.vertical(|ui| {
+                            let resp = ui.add(egui::Slider::new(&mut g, -12.0..=12.0).show_value(false).orientation(egui::SliderOrientation::Vertical).custom_formatter(|v, _| format!("{:+}", v as i32)));
+                            if resp.changed() {
+                                self.eq_set(i, g);
+                            }
+                            let f0 = EQ_BANDS[i];
+                            let ftext = if f0 >= 1000.0 { format!("{:.0}k", f0 / 1000.0) } else { format!("{}", f0 as i32) };
+                            ui.label(RichText::new(ftext).color(th.btn_fg).monospace().size(8.0));
+                        });
+                    }
+                });
+            }
 
             ui.separator();
 
@@ -5326,22 +5505,56 @@ video_ended: false,
                     resp.request_focus();
                     self.yt_focus = false;
                 }
-                if retro_btn(ui, "Download", Color32::from_rgb(255, 240, 160), th.btn_bg).clicked() {
-                    let q = self.yt_query.clone();
-                    if q.trim().is_empty() {
-                        self.set_error("Enter a YouTube URL or search term");
-                    } else {
-                        self.yt_pct = 0.0;
-                        self.yt_speed.clear();
-                        self.yt_eta.clear();
-                        self.set_status(format!("YouTube: saving to {}", music_folder().display()));
-                        let _ = self.net_tx.send(NetCmd::YtDownload(q));
+                if retro_btn(ui, if self.yt_queue_mode { "QUEUE" } else { "SINGLE" },
+                    if self.yt_queue_mode { Color32::from_rgb(120, 220, 255) } else { Color32::from_rgb(255, 240, 160) },
+                    th.btn_bg,
+                ).clicked() {
+                    self.yt_queue_mode = !self.yt_queue_mode;
+                }
+                if self.yt_queue_mode {
+                    if retro_btn(ui, "Add", Color32::from_rgb(255, 240, 160), th.btn_bg).clicked() {
+                        let q = self.yt_query.clone();
+                        self.yt_queue_add(&q);
+                    }
+                    if retro_btn(ui, &format!("Queue ({})", self.yt_queue.len()), th.btn_fg, th.btn_bg).clicked() {
+                        self.yt_queue_show = true;
+                    }
+                } else {
+                    let busy = self.yt_queue_processing;
+                    if retro_btn(ui, if busy { "QUEUE BUSY" } else { "Download" },
+                        if busy { darken(th.btn_fg, 0.5) } else { Color32::from_rgb(255, 240, 160) },
+                        th.btn_bg,
+                    ).clicked() && !busy {
+                        let q = self.yt_query.clone();
+                        if q.trim().is_empty() {
+                            self.set_error("Enter a YouTube URL or search term");
+                        } else {
+                            self.yt_pct = 0.0;
+                            self.yt_speed.clear();
+                            self.yt_eta.clear();
+                            self.set_status(format!("YouTube: saving to {}", music_folder().display()));
+                            let _ = self.yt_tx.send(YtCmd::Download { query: q, auto_play: true, chunks: 1 });
+                        }
                     }
                 }
                 ui.label(RichText::new("-> ").color(th.btn_fg).monospace().size(10.0));
                 let folder = music_folder().to_string_lossy().to_string();
                 ui.label(RichText::new(truncate_mid(&folder, 46)).color(Color32::from_gray(120)).monospace().size(10.0));
             });
+            if self.yt_pct > -1.0 {
+                let status = if self.yt_speed.is_empty() {
+                    "starting...".to_string()
+                } else {
+                    format!("{}  ETA {}", self.yt_speed, self.yt_eta)
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("▼").color(th.accent).monospace().size(10.0));
+                    ui.add(egui::ProgressBar::new((self.yt_pct / 100.0).clamp(0.0, 1.0))
+                        .desired_width(f32::INFINITY)
+                        .text(RichText::new(format!("{:.0}%  {}", self.yt_pct, status)).color(Color32::from_gray(230)).monospace().size(10.0))
+                        .fill(Color32::from_rgb(28, 224, 255)));
+                });
+            }
 
             let query = self.search_query.to_lowercase();
             let cur_song = self.state.current_song.clone();
@@ -5833,8 +6046,13 @@ video_ended: false,
     fn fetch_lyrics(&mut self) {
         if let Some(s) = self.state.current_song.clone() {
             let (mut artist, mut title) = (self.meta.1.clone(), self.meta.0.clone());
+            if let Some(t) = strip_track_no(&title) {
+                title = t;
+            }
             if artist.is_empty() || artist == "Unknown" {
-                if let Some(idx) = title.find(" - ") {
+                if let Some((a, _)) = folder_artist_album(&s) {
+                    artist = a;
+                } else if let Some(idx) = title.find(" - ") {
                     let a = title[..idx].trim();
                     let t = title[idx + 3..].trim();
                     if !a.is_empty() && !t.is_empty() {
@@ -5843,10 +6061,133 @@ video_ended: false,
                     }
                 }
             }
+            self.lyrics_for = Some(s.clone());
             self.set_status("Fetching lyrics...");
             let _ = self.net_tx.send(NetCmd::Lyrics(artist, title));
             let _ = s;
         }
+    }
+
+    fn yt_queue_add(&mut self, q: &str) {
+        let q = q.trim().to_string();
+        if q.is_empty() {
+            self.set_error("Enter a YouTube URL or search term");
+            return;
+        }
+        let idx = self.yt_queue.len();
+        self.yt_queue.push((q.clone(), q.clone()));
+        self.yt_query.clear();
+        self.yt_queue_show = true;
+        self.set_status(format!("Queued: {}", truncate_mid(&q, 50)));
+        let _ = self.yt_tx.send(YtCmd::Resolve { idx, query: q });
+    }
+
+    fn yt_queue_start(&mut self) {
+        if self.yt_queue_processing || self.yt_queue.is_empty() {
+            return;
+        }
+        self.yt_queue_processing = true;
+        self.yt_queue_show = true;
+        self.yt_queue_send_next();
+    }
+
+    fn yt_queue_send_next(&mut self) {
+        if !self.yt_queue_processing {
+            return;
+        }
+        if self.yt_queue.is_empty() {
+            self.yt_queue_processing = false;
+            self.yt_queue_active = None;
+            self.set_status("Queue finished");
+            return;
+        }
+        let (q, disp) = self.yt_queue.remove(0);
+        let shown = if disp.is_empty() { q.clone() } else { disp };
+        self.yt_queue_active = Some(shown.clone());
+        self.set_status(format!("Queue: downloading \"{}\"...", truncate_mid(&shown, 60)));
+        let _ = self.yt_tx.send(YtCmd::Download { query: q, auto_play: false, chunks: 8 });
+    }
+
+    fn yt_queue_advance(&mut self) {
+        self.yt_queue_active = None;
+        if self.yt_queue.is_empty() {
+            self.yt_queue_processing = false;
+            self.set_status("Queue finished");
+        } else {
+            self.yt_queue_send_next();
+        }
+    }
+
+    fn ui_queue_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.yt_queue_show;
+        let mut closed = false;
+        let max_h: f32 = (ctx.viewport_rect().height() * 0.6).clamp(120.0, 900.0);
+        egui::Window::new("YT DOWNLOAD QUEUE")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([480.0, 320.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let th = self.theme_colors();
+                ui.horizontal(|ui| {
+                    if retro_btn(ui, "Start", Color32::from_rgb(0, 255, 0), th.btn_bg).clicked() {
+                        self.yt_queue_start();
+                    }
+                    let clear_d = self.yt_queue_processing;
+                    if retro_btn(ui, "Clear", if clear_d { darken(Color32::from_rgb(255, 160, 80), 0.5) } else { Color32::from_rgb(255, 160, 80) }, th.btn_bg).clicked() && !clear_d {
+                        self.yt_queue.clear();
+                        self.set_status("Queue cleared");
+                    }
+                    if retro_btn(ui, "Close", Color32::from_rgb(200, 80, 80), th.btn_bg).clicked() {
+                        closed = true;
+                    }
+                    ui.label(RichText::new(if self.yt_queue_processing { "RUNNING" } else { "STANDBY" })
+                        .color(if self.yt_queue_processing { Color32::from_rgb(0, 255, 0) } else { th.btn_fg })
+                        .monospace().size(11.0));
+                });
+                ui.add_space(4.0);
+                match &self.yt_queue_active {
+                    Some(a) => {
+                        ui.label(RichText::new(format!("NOW: {}", truncate_mid(a, 46))).color(Color32::from_rgb(0, 255, 0)).monospace().size(11.0));
+                    }
+                    None if self.yt_queue_processing => {
+                        ui.label(RichText::new("NOW: ...").color(Color32::from_rgb(0, 255, 0)).monospace().size(11.0));
+                    }
+                    _ => {}
+                }
+                if self.yt_queue_processing && self.yt_pct > -1.0 {
+                    let status = if self.yt_speed.is_empty() {
+                        "starting...".to_string()
+                    } else {
+                        format!("{}  ETA {}", self.yt_speed, self.yt_eta)
+                    };
+                    ui.add(egui::ProgressBar::new(self.yt_pct / 100.0)
+                        .desired_width(f32::INFINITY)
+                        .text(RichText::new(status).color(Color32::from_gray(200)).monospace().size(10.0))
+                        .fill(Color32::from_rgb(28, 224, 255)));
+                }
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    if self.yt_queue.is_empty() && !self.yt_queue_processing {
+                        ui.label(RichText::new("Queue empty. Add downloads with the YT row (QUEUE mode).").color(Color32::from_gray(140)).monospace().size(11.0));
+                    }
+                    let items: Vec<(String, String)> = self.yt_queue.clone();
+                    for (i, it) in items.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{:>2}.", i + 1)).color(Color32::from_gray(150)).monospace().size(11.0));
+                            ui.label(RichText::new(truncate_mid(&it.1, 36)).color(th.fg).monospace().size(11.0));
+                            if retro_btn(ui, "X", Color32::from_rgb(255, 120, 120), th.btn_bg).clicked() {
+                                if !self.yt_queue_processing {
+                                    if let Some(idx) = self.yt_queue.iter().position(|x| x.0 == it.0) {
+                                        self.yt_queue.remove(idx);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        self.yt_queue_show = open && !closed;
     }
 
     fn play_video(&mut self) {
@@ -5874,26 +6215,35 @@ video_ended: false,
     }
 
     fn attach_video_audio(&mut self, path: &str, seek: f32) {
+        self.video_clock.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.video_seek_base = seek.max(0.0);
+        av_log(&format!("attach_audio path={} seek={:.3} paused={} tex={}", path, seek, self.video_paused, self.video_tex.is_some()));
         match spawn_video_audio(path, &ffmpeg_path(), seek) {
             Ok((mut child, pipe)) => {
                 if let Ok(sink) = Sink::try_new(&self._stream_handle) {
                     sink.set_volume(self.video_volume as f32 / 100.0 * 0.9);
-                    sink.append(pipe);
+                    sink.pause();
+                    sink.append(EqSource::new(pipe, self.eq_shared.clone()));
                     if !self.video_paused {
                         if self.video_tex.is_some() {
                             sink.play();
+                            av_log("audio started immediately (tex present)");
                         } else {
                             self.video_audio_pending = true;
+                            av_log("audio pending first frame");
                         }
                     }
+                    self.video_open_at = self.ctx.input(|i| i.time);
                     self.video_audio_proc = Some(child);
                     self.video_sink = Some(sink);
                 } else {
                     let _ = child.kill();
+                    av_log("audio sink creation FAILED");
                 }
             }
             Err(e) => {
                 self.video_audio_pending = false;
+                av_log(&format!("audio spawn FAILED (video only): {}", e));
                 self.set_status(format!("MOVIE (video only): {}", e));
             }
         }
@@ -5969,7 +6319,7 @@ video_ended: false,
         self.attach_video_audio(&path, saved_pos);
         self.video_cur_secs = saved_pos;
         self.set_status(format!("MOVIE {}/{}: {}", self.video_queue_idx + 1, self.video_queue.len(), stem(&path)));
-        self.maybe_analyze_video(&path);
+        self.video_deferred_open = true;
     }
 
     fn enqueue_videos(&mut self, paths: Vec<String>) {
@@ -6072,12 +6422,13 @@ video_ended: false,
         }
         self.analyzing_video.insert(path.to_string());
         let gen = self.video_gen;
+        av_log(&format!("analyze START {}", path));
         let _ = self.lib_tx.send(LibCmd::VideoAnalyze { path: path.to_string(), gen });
         self.set_status(format!("ANALYZE intro/credits: {}", stem(path)));
     }
 
-    fn try_cut_current_video(&self, path: String) {
-        if !self.intro_skip_enabled || self.intro_skip_secs > 2.0 && false {
+    fn try_cut_current_video(&mut self, path: String) {
+        if !self.intro_skip_enabled {
             return;
         }
         if path.ends_with("_cut.mkv") || self.video_cut_inflight.contains(&path) || self.video_cut_cache.contains_key(&path) {
@@ -6090,7 +6441,9 @@ video_ended: false,
         if !mkvmerge_path().is_file() {
             return;
         }
+        self.video_cut_inflight.insert(path.clone());
         let gen = self.video_gen;
+        av_log(&format!("cut START {} ie={:.2} cs={:.2}", path, ie, cs));
         let _ = self.lib_tx.send(LibCmd::VideoCut { path, gen, intro_end: ie, credits_start: cs });
     }
 
@@ -6526,6 +6879,23 @@ impl eframe::App for PlayerApp {
 
         self.drain_msg();
         self.update_playback_state();
+        if let Some(s) = &self.video_sink {
+            if self.video_audio_pending || self.video_paused {
+                self.video_clock.store(0, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let pos = s.get_pos().as_millis() as u64 + 1;
+                let tagged = (((self.video_gen as u64) & 0xFFFF) << 48) | pos.min((1u64 << 48) - 1);
+                self.video_clock.store(tagged, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else {
+            self.video_clock.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.video_audio_pending && !self.video_paused && now - self.video_open_at > 2.5 {
+            self.video_audio_pending = false;
+            if let Some(s) = &self.video_sink {
+                s.play();
+            }
+        }
         self.tick_radio(now);
         self.poll_ext();
         self.handle_keys();
@@ -6551,6 +6921,9 @@ impl eframe::App for PlayerApp {
         }
         if self.lyrics.is_some() {
             self.ui_lyrics();
+        }
+        if self.yt_queue_show {
+            self.ui_queue_window(&ctx);
         }
     }
 }
@@ -6850,6 +7223,41 @@ fn band_of_file(path: &str) -> String {
     band_of(path)
 }
 
+fn folder_artist_album(path: &str) -> Option<(String, String)> {
+    let parent = Path::new(path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|f| f.to_string_lossy().to_string())?;
+    let mut name = parent.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(open) = name.rfind('(') {
+        if name.ends_with(')') {
+            name = name[..open].trim().to_string();
+        }
+    }
+    if let Some(pos) = name.find(" - ") {
+        let artist = name[..pos].trim().to_string();
+        let album = name[pos + 3..].trim().to_string();
+        if !artist.is_empty() {
+            return Some((artist, album));
+        }
+    }
+    Some((name, String::new()))
+}
+
+fn strip_track_no(title: &str) -> Option<String> {
+    if let Some(sep) = title.find(" - ") {
+        let head = title[..sep].trim();
+        let digits = !head.is_empty() && head.chars().all(|c| c.is_ascii_digit() || c == '.');
+        if digits {
+            return Some(title[sep + 3..].trim().to_string());
+        }
+    }
+    None
+}
+
 fn load_bands(path: &std::path::Path) -> HashMap<String, Vec<String>> {
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Ok(map) = serde_json::from_str::<HashMap<String, Vec<String>>>(&text) {
@@ -6857,6 +7265,23 @@ fn load_bands(path: &std::path::Path) -> HashMap<String, Vec<String>> {
         }
     }
     HashMap::new()
+}
+
+// A/V debugging log for developers.
+// When true, every av_log() call appends a line to %APPDATA%\MediaPlayerOFDOOM\avsync.log.
+// Useful for tracking intro/credits skip, seek, and audio-clock behavior.
+// Set to true to re-enable diagnostics; keep false for release builds (av_log is a no-op).
+const AV_DEBUG_LOG: bool = false;
+
+fn av_log(msg: &str) {
+    if !AV_DEBUG_LOG {
+        return;
+    }
+    use std::io::Write as _;
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(data_dir().join("avsync.log")) {
+        let _ = writeln!(f, "[{}] {}", ms, msg);
+    }
 }
 
 fn main() -> eframe::Result {
@@ -6896,76 +7321,121 @@ std::panic::set_hook(Box::new(|info| {
 #[cfg(test)]
 mod eq_dsp_tests {
     use super::*;
-    use rodio::Source;
 
-    fn rms(path: &Path) -> f64 {
-        let mut r = hound::WavReader::open(path).expect("open wav");
-        let samples: Vec<i16> = r.samples::<i16>().map(|s| s.unwrap()).collect();
-        if samples.is_empty() {
-            return 0.0;
-        }
-        let sum: f64 = samples.iter().map(|&x| (x as f64 / 32767.0).powi(2)).sum();
-        (sum / samples.len() as f64).sqrt()
+    struct SineSource {
+        rate: u32,
+        t: f64,
+        n: usize,
+        f0: f64,
+        f1: f64,
+        amp0: f64,
+        amp1: f64,
     }
 
-    #[test]
-    fn encode_eq_changes_signal() {
-        let dir = std::env::temp_dir().join("mediaplayerofdoom_eqtest");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("in.wav");
-        let rate = 44100u32;
-        let spec = hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-        {
-            let mut w = hound::WavWriter::create(&src, spec).unwrap();
-            let n = rate as usize * 3;
-            for i in 0..n {
-                let t = i as f64 / rate as f64;
-                let v = (2.0 * std::f64::consts::PI * 80.0 * t).sin() * 0.3
-                    + (2.0 * std::f64::consts::PI * 1500.0 * t).sin() * 0.3;
-                w.write_sample((v * 32767.0) as i16).unwrap();
+    impl SineSource {
+        fn new(rate: u32, secs: f64, f0: f64, amp0: f64, f1: f64, amp1: f64) -> Self {
+            SineSource { rate, t: 0.0, n: (rate as f64 * secs) as usize, f0, f1, amp0, amp1 }
+        }
+    }
+
+    impl Iterator for SineSource {
+        type Item = f32;
+        fn next(&mut self) -> Option<f32> {
+            if self.n == 0 {
+                return None;
             }
+            self.n -= 1;
+            let s = self.t;
+            let v = self.amp0 * (2.0 * std::f64::consts::PI * self.f0 * s).sin()
+                + self.amp1 * (2.0 * std::f64::consts::PI * self.f1 * s).sin();
+            self.t += 1.0 / self.rate as f64;
+            Some(v as f32)
         }
-        let out = std::env::temp_dir().join("mediaplayerofdoom_eqtest.wav");
-        let _ = std::fs::remove_file(&out);
-        encode_eq(src.to_string_lossy().as_ref(), &[8.0, 6.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &out).expect("encode ok");
-        assert!(out.is_file(), "eq output file exists");
-        let a = rms(&src);
-        let b = rms(&out);
-        assert!(b > a * 1.5, "EQ should boost RMS: in={:.4} out={:.4}", a, b);
-
-        let _ = std::fs::remove_file(&out);
-        encode_eq(src.to_string_lossy().as_ref(), &[-8.0, -6.0, -4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &out).expect("cut ok");
-        let c = rms(&out);
-        assert!(c < a * 0.9, "EQ cut should reduce RMS: in={:.4} out={:.4}", a, c);
-
-        let f = File::open(&out).expect("eq wav open");
-        let dec = rodio::Decoder::new(BufReader::new(f)).expect("rodio decodes eq wav");
-        let (sr, ch) = (dec.sample_rate(), dec.channels());
-        assert!(sr > 0 && ch >= 1, "eq wav valid params");
-        drop(dec);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn wav_bool(bytes: &[u8]) -> bool {
-        bytes.get(8..12) == Some("WAVE".as_bytes())
+    impl rodio::Source for SineSource {
+        fn current_frame_len(&self) -> Option<usize> { None }
+        fn channels(&self) -> u16 { 1 }
+        fn sample_rate(&self) -> u32 { self.rate }
+        fn total_duration(&self) -> Option<std::time::Duration> { None }
+    }
+
+    fn drain_eq(gains: [f32; 10], src: impl rodio::Source<Item = f32>) -> f64 {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(EqShared { gains, dirty: true }));
+        let mut eq = EqSource::new(src, shared);
+        eq.preamp = 1.0;
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        while let Some(s) = eq.next() {
+            sum += (s as f64).powi(2);
+            n += 1;
+        }
+        if n == 0 { 0.0 } else { (sum / n as f64).sqrt() }
     }
 
     #[test]
-    fn encode_eq_alters_real_song() {
-        let real = match std::env::var("MPD_TEST_MP3") {
-            Ok(p) if Path::new(&p).is_file() => p,
-            _ => return,
-        };
-        let a1 = std::fs::read(&real).expect("read real song");
-        let out = std::env::temp_dir().join("mediaplayerofdoom_eqtest_real.wav");
-        let _ = std::fs::remove_file(&out);
-        encode_eq(&real, &[6.0, 5.0, 3.0, -2.0, 2.0, 6.0, 7.0, 6.0, 5.0, 4.0], &out).expect("real song encodes");
-        let a2 = std::fs::read(&out).expect("read eq output");
-        assert!(!wav_bool(&a1), "source of a compressed song should not be a wav");
-        assert!(wav_bool(&a2), "eq output is a wav file");
-        let diff = rms(&out);
-        assert!(diff > 0.01, "eq output has real audio content: rms={}", diff);
-        let _ = std::fs::remove_file(&out);
+    fn eq_boost_raises_rms() {
+        let base = SineSource::new(44100, 2.0, 60.0, 0.3, 1500.0, 0.3);
+        let boosted = drain_eq([8.0, 6.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], base);
+        let base = SineSource::new(44100, 2.0, 60.0, 0.3, 1500.0, 0.3);
+        let flat = drain_eq([0.0; 10], base);
+        assert!(boosted > flat * 1.5, "boost should raise RMS: flat={} eq={}", flat, boosted);
+    }
+
+    #[test]
+    fn eq_cut_lowers_rms() {
+        let base = SineSource::new(44100, 2.0, 60.0, 0.3, 1500.0, 0.3);
+        let cut = drain_eq([-8.0, -6.0, -4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], base);
+        let base = SineSource::new(44100, 2.0, 60.0, 0.3, 1500.0, 0.3);
+        let flat = drain_eq([0.0; 10], base);
+        assert!(cut < flat * 0.95, "cut should lower RMS: flat={} eq={}", flat, cut);
+    }
+
+    #[test]
+    fn eq_flat_is_passthrough() {
+        let base = SineSource::new(44100, 1.0, 440.0, 0.5, 880.0, 0.2);
+        let a = drain_eq([0.0; 10], base);
+        let base = SineSource::new(44100, 1.0, 440.0, 0.5, 880.0, 0.2);
+        let mut src = base;
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        while let Some(s) = src.next() {
+            sum += (s as f64).powi(2);
+            n += 1;
+        }
+        let raw = if n == 0 { 0.0 } else { (sum / n as f64).sqrt() };
+        assert!((a - raw).abs() < 1e-6, "flat EQ equals input: raw={} eq={}", raw, a);
+    }
+
+    #[test]
+    fn eq_curve_reaches_boost_at_center() {
+        let mut gains = [0.0f32; 10];
+        gains[0] = 8.0;
+        let boosted = eq_response_linear(EQ_BANDS[0], &gains, 44100.0);
+        let flat = eq_response_linear(EQ_BANDS[0], &[0.0; 10], 44100.0);
+        assert!(boosted > flat * 1.9, "boost dB reached at band center: flat={} eq={}", flat, boosted);
+    }
+
+    #[test]
+    fn eq_curve_reaches_cut_at_center() {
+        let mut gains = [0.0f32; 10];
+        gains[0] = -8.0;
+        let cut = eq_response_linear(EQ_BANDS[0], &gains, 44100.0);
+        let flat = eq_response_linear(EQ_BANDS[0], &[0.0; 10], 44100.0);
+        assert!(cut < flat * 0.5, "cut dB reached at band center: flat={} eq={}", flat, cut);
+    }
+
+    #[test]
+    fn eq_auto_preamp_limits_clipping() {
+        let gains = [12.0; 10];
+        let pa = eq_auto_preamp(&gains, 44100.0);
+        assert!(pa <= 1.0, "heavy boost should not raise gain: {}", pa);
+        assert!(pa > 0.001, "preamp sane: {}", pa);
+        assert!(pa < 1.0, "heavy boost should auto-gain down: {}", pa);
+        let peak = (22u32..=20000u32)
+            .step_by(17)
+            .map(|f| eq_response_linear(f as f64, &gains, 44100.0))
+            .fold(0.0f64, f64::max);
+        assert!(peak * pa as f64 <= 1.05, "preamped curve peak ~0dB: peak={} pa={}", peak, pa);
     }
 }

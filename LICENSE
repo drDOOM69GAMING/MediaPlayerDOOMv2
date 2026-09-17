@@ -19,3 +19,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-party components
+
+This MIT License covers only the original code in this project. The application
+embeds third-party tools (FFmpeg/FFprobe [GPL v3], yt-dlp [Unlicense],
+MKVToolNix mkvmerge [GPL v2]) and links Rust crates (MIT/Apache/MPL/etc.).
+Each is used under its own license and belongs to its respective authors.
+See THIRD-PARTY-NOTICES.md for full attribution, license references, and thanks.

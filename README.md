@@ -55,8 +55,33 @@ The binary lands at `target/release/mediaplayerofdoom.exe`. It finds your music 
 
 ## Notes
 
-- The equalizer is currently **locked to FLAT** and shows a hover hint explaining why. It caused playback problems (videos stuck loading, bogus metadata) when enabled, so it has been disabled until the background EQ encode is reworked in a future build. Band changes / preset cycling / the ON-OFF toggle are disabled.
+- The **AUTO preamp** in the EQ measures the boosted response and backs off the gain automatically so you never clip, even with a loud preset.
+- The EQ curve panel, preset cycling, band sliders, and the ON-OFF toggle all apply your changes live while music plays, with no restart and no temporary files.
 - If you build from source and have `tools/ffmpeg.exe`, `tools/ffprobe.exe`, `tools/yt-dlp.exe` next to `Cargo.toml`, they are embedded into the exe by `build.rs` (that folder is gitignored). Without them the app falls back to downloading on first run.
+
+## Acknowledgements
+
+This app is built on the work of some incredible open-source projects, and it wouldn't exist without them:
+
+- **FFmpeg / FFprobe** (GPL v3) — audio/video decoding, transcoding, metadata, and analysis. <https://ffmpeg.org/> · <https://www.gyan.dev/ffmpeg/builds/>
+- **yt-dlp** (Unlicense) — YouTube downloads. <https://github.com/yt-dlp/yt-dlp>
+- **MKVToolNix / mkvmerge** (GPL v2) — real lossless video cuts at INTRO/CREDS markers. <https://mkvtoolnix.download/>
+- **egui / eframe** (MIT/Apache-2.0) — the immediate-mode GUI toolkit that renders the whole DOOM-styled interface. <https://github.com/emilk/egui>
+- **rodio / cpal** (MIT/Apache-2.0, Apache-2.0) — audio playback and device access.
+- **symphonia** (MPL-2.0) — pure-Rust media demuxing/decoding.
+- The **Rust** language and its crate ecosystem.
+
+Full details, license texts, and donation links are in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). If you can, consider donating to FFmpeg, yt-dlp, and MKVToolNix — they give this all away for free.
+
+## v2.8.0 changelog
+
+- **Real-time in-app equalizer** (replaces the old offline process-and-swap EQ that had to be disabled): a 10-band EQ (60 Hz–16 kHz) processes the audio live in the playback chain, so band changes, presets, and the ON/OFF toggle apply instantly mid-song with zero interruption.
+- **EQ curve panel**: a 20 Hz–20 kHz response graph shows the combined EQ curve with band markers and current values, plus the **AUTO** preamp percentage.
+- **Presets**: `◀ EQ` / `EQ ▶` cycle through preset curves (Bass Boost, Rock, Pop, etc.), the same style of graphic-equalizer presets the AQUA system EQ uses.
+- **10 vertical band sliders** (−12 to +12 dB) with per-band labels; touch any slider and it becomes your **Custom** curve.
+- **EQ settings are saved**: EQ on/off, the active preset, and your custom curve reload with the app.
+- **Works everywhere**: the EQ applies to music, the tape, radio streams, and video audio alike.
+- **EQ auto-preamp**: because boosting bands can clip, the app measures the boosted response (20 Hz–20 kHz sweep) and scales it down so the loudest part sits right at full scale — loud, clean, no distortion.
 
 ## v2.7.0 changelog
 
